@@ -34,11 +34,6 @@ Common:
 - `LAD_REPO_ROOT` (repo to review; default: current working directory)
 - `LAD_ENV_FILE` (optional `KEY=VALUE` file, loaded only for missing vars)
 
-PowerShell example:
-- `$env:LAD_ENV_FILE=\"test.env\"; $env:LAD_REPO_ROOT=\"D:\\PycharmProjects\\Shelpuk\\lad_mcp_server\"; uv run lad-mcp-server`
-
-Timeout note: if Serena tool calling is enabled, a single review may require multiple OpenRouter requests; set `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` accordingly.
-
 ## Path-based review requests
 
 Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dirs under `LAD_REPO_ROOT`). When `paths` are provided, Lad reads and embeds **text-like** files from disk (language-agnostic) and skips common binary files and oversized files.
