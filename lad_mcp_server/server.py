@@ -30,6 +30,7 @@ def create_app() -> Any:
     async def system_design_review(
         proposal: str | None = None,
         paths: list[str] | None = None,
+        project_root: str | None = None,
         constraints: str | None = None,
         context: str | None = None,
         model: str | None = None,
@@ -41,6 +42,7 @@ def create_app() -> Any:
             return await service.system_design_review(
                 proposal=proposal,
                 paths=paths,
+                project_root=project_root,
                 constraints=constraints,
                 context=context,
                 model=model,
@@ -54,6 +56,7 @@ def create_app() -> Any:
     async def code_review(
         code: str | None = None,
         paths: list[str] | None = None,
+        project_root: str | None = None,
         language: str | None = None,
         focus: str | None = None,
         model: str | None = None,
@@ -62,7 +65,14 @@ def create_app() -> Any:
         Review a code snippet or diff using two LLM reviewers in parallel.
         """
         try:
-            return await service.code_review(code=code, paths=paths, language=language, focus=focus, model=model)
+            return await service.code_review(
+                code=code,
+                paths=paths,
+                project_root=project_root,
+                language=language,
+                focus=focus,
+                model=model,
+            )
         except ValidationError as exc:
             return format_validation_error(str(exc))
         except Exception as exc:  # pragma: no cover

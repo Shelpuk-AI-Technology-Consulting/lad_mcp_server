@@ -130,6 +130,7 @@ class TestReviewServiceToolLoop(unittest.TestCase):
             out = asyncio.run(
                 service.system_design_review(
                     proposal="This is a valid proposal with enough length.",
+                    project_root=str(repo),
                     constraints=None,
                     context=None,
                     model=None,

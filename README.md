@@ -13,9 +13,9 @@ Lad ships a stdio CLI entrypoint: `lad-mcp-server`.
 
 - Run from a local checkout (recommended for development): `uv run lad-mcp-server`
 - One-off run from git (works well for MCP hosts launching tools via `uvx`):
-  - `uvx --from git+https://github.com/<you>/<repo>.git lad-mcp-server`
+  - `uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server`
 
-Tip: `uvx` runs tools in an isolated environment; set `LAD_REPO_ROOT` so Lad knows which repo to read.
+Tip: `uvx` runs tools in an isolated environment; pass `project_root` in each tool call so Lad knows which repo to read.
 
 ## Codex setup (CLI-only)
 
@@ -30,8 +30,7 @@ Add Lad as a local stdio MCP server (macOS / Linux):
 ```bash
 codex mcp add lad \
   --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
-  --env LAD_REPO_ROOT="/absolute/path/to/the/repo-you-want-reviewed" \
-  -- uvx --from git+https://github.com/<you>/<repo>.git lad-mcp-server
+  -- uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server
 ```
 
 Windows (PowerShell):
@@ -39,9 +38,10 @@ Windows (PowerShell):
 ```powershell
 codex mcp add lad `
   --env OPENROUTER_API_KEY="$env:OPENROUTER_API_KEY" `
-  --env LAD_REPO_ROOT="D:\Path\To\Repo\To\Review" `
-  -- uvx --from git+https://github.com/<you>/<repo>.git lad-mcp-server
+  -- uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server
 ```
+
+Per-project usage: pass `project_root` and `paths` in each tool call (recommended when one Codex config is used across many repos). If `project_root` is omitted, Lad falls back to the server process CWD (or infers from absolute `paths`).
 
 ## Configuration (environment variables)
 
@@ -53,12 +53,11 @@ Common:
 - `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `z-ai/glm-4.7`)
 - `OPENROUTER_REVIEWER_TIMEOUT_SECONDS` (default: `180`, per reviewer)
 - `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `240`, per tool call)
-- `LAD_REPO_ROOT` (repo to review; default: current working directory)
 - `LAD_ENV_FILE` (optional `KEY=VALUE` file, loaded only for missing vars)
 
 ## Path-based review requests
 
-Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dirs under `LAD_REPO_ROOT`). When `paths` are provided, Lad reads and embeds **text-like** files from disk (language-agnostic) and skips common binary files and oversized files.
+Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dirs under `project_root` / inferred absolute `paths` / CWD). When `paths` are provided, Lad reads and embeds **text-like** files from disk (language-agnostic) and skips common binary files and oversized files.
 During directory expansion, hidden files and directories (dotfiles) are skipped; pass an explicit path (e.g., `.gitignore`) if you want it included.
 
 Example tool payloads:

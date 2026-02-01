@@ -1,5 +1,4 @@
 import asyncio
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,15 +31,14 @@ class _OpenRouterCaptureStub:
         tool_choice=None,
         extra_body=None,
     ):
-        # Capture the user prompt so the test can assert that file content was embedded.
         for msg in messages:
             if msg.get("role") == "user":
                 self.user_messages.append(msg.get("content", ""))
         return type("R", (), {"content": "## Summary\nOK", "tool_calls": [], "raw": {}})()
 
 
-class TestRepoRootEnv(unittest.TestCase):
-    def test_lad_repo_root_is_used_when_repo_root_not_provided(self) -> None:
+class TestMultiProjectRoot(unittest.TestCase):
+    def test_service_can_switch_projects_per_call(self) -> None:
         primary = "moonshotai/kimi-k2-thinking"
         meta = ModelMetadata(
             model_id=primary,
@@ -48,7 +46,6 @@ class TestRepoRootEnv(unittest.TestCase):
             supported_parameters=("max_tokens",),
             provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
         )
-
         settings = Settings(
             openrouter_api_key="test",
             openrouter_primary_reviewer_model=primary,
@@ -71,44 +68,47 @@ class TestRepoRootEnv(unittest.TestCase):
             lad_serena_max_search_results=20,
         )
 
-        with tempfile.TemporaryDirectory() as repo_td, tempfile.TemporaryDirectory() as other_cwd_td:
-            repo = Path(repo_td)
-            (repo / "hello.js").write_text("console.log('hello');\n", encoding="utf-8")
+        capture = _OpenRouterCaptureStub()
+        models = _ModelsStub({primary: meta})
 
-            capture = _OpenRouterCaptureStub()
-            models = _ModelsStub({primary: meta})
+        service = ReviewService(
+            repo_root=None,
+            settings=settings,
+            openrouter_client=capture,
+            models_client=models,
+        )
 
-            prev_cwd = Path.cwd()
-            prev_env = os.environ.get("LAD_REPO_ROOT")
-            os.environ["LAD_REPO_ROOT"] = str(repo)
-            try:
-                os.chdir(other_cwd_td)
-                service = ReviewService(
-                    repo_root=None,
-                    settings=settings,
-                    openrouter_client=capture,
-                    models_client=models,
+        with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
+            repo1 = Path(td1)
+            repo2 = Path(td2)
+            (repo1 / "a.txt").write_text("repo1\n", encoding="utf-8")
+            (repo2 / "a.txt").write_text("repo2\n", encoding="utf-8")
+
+            asyncio.run(
+                service.code_review(
+                    code=None,
+                    paths=["a.txt"],
+                    project_root=str(repo1),
+                    language=None,
+                    focus=None,
+                    model=None,
                 )
-                out = asyncio.run(
-                    service.code_review(
-                        code=None,
-                        paths=["hello.js"],
-                        language=None,
-                        focus=None,
-                        model=None,
-                    )
+            )
+            asyncio.run(
+                service.code_review(
+                    code=None,
+                    paths=["a.txt"],
+                    project_root=str(repo2),
+                    language=None,
+                    focus=None,
+                    model=None,
                 )
-            finally:
-                os.chdir(prev_cwd)
-                if prev_env is None:
-                    os.environ.pop("LAD_REPO_ROOT", None)
-                else:
-                    os.environ["LAD_REPO_ROOT"] = prev_env
+            )
 
-        self.assertIn("## Primary Reviewer", out)
-        self.assertTrue(capture.user_messages)
-        joined = "\n".join(capture.user_messages)
-        self.assertIn("--- BEGIN FILE: hello.js", joined)
+        joined = "\n\n---\n\n".join(capture.user_messages)
+        self.assertIn("--- BEGIN FILE: a.txt", joined)
+        self.assertIn("repo1", joined)
+        self.assertIn("repo2", joined)
 
 
 if __name__ == "__main__":

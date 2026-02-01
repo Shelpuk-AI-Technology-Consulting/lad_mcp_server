@@ -9,6 +9,7 @@ class TestSchemas(unittest.TestCase):
             SystemDesignReviewRequest.validate(
                 proposal="too short",
                 paths=None,
+                project_root=None,
                 constraints=None,
                 context=None,
                 model=None,
@@ -19,6 +20,7 @@ class TestSchemas(unittest.TestCase):
         req = SystemDesignReviewRequest.validate(
             proposal=None,
             paths=["README.md"],
+            project_root=None,
             constraints=None,
             context=None,
             model=None,
@@ -31,6 +33,7 @@ class TestSchemas(unittest.TestCase):
             CodeReviewRequest.validate(
                 code="print('hi')",
                 paths=None,
+                project_root=None,
                 language="python",
                 focus="unknown",
                 model=None,
@@ -41,6 +44,7 @@ class TestSchemas(unittest.TestCase):
         req = CodeReviewRequest.validate(
             code="print('hi')",
             paths=None,
+            project_root=None,
             language="python",
             focus="security",
             model=None,
@@ -52,12 +56,25 @@ class TestSchemas(unittest.TestCase):
         req = CodeReviewRequest.validate(
             code=None,
             paths=["lad_mcp_server/server.py"],
+            project_root=None,
             language=None,
             focus=None,
             model=None,
             max_input_chars=1000,
         )
         self.assertEqual(req.paths, ["lad_mcp_server/server.py"])
+
+    def test_project_root_blank_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            SystemDesignReviewRequest.validate(
+                proposal="0123456789",
+                paths=None,
+                project_root="",
+                constraints=None,
+                context=None,
+                model=None,
+                max_input_chars=1000,
+            )
 
 
 if __name__ == "__main__":

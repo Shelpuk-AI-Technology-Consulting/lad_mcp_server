@@ -32,6 +32,7 @@ def _max_len(value: str | None, field_name: str, max_chars: int) -> str | None:
 class SystemDesignReviewRequest:
     proposal: str | None
     paths: list[str] | None = None
+    project_root: str | None = None
     constraints: str | None = None
     context: str | None = None
     model: str | None = None
@@ -41,6 +42,7 @@ class SystemDesignReviewRequest:
         *,
         proposal: str | None,
         paths: list[str] | None,
+        project_root: str | None,
         constraints: str | None,
         context: str | None,
         model: str | None,
@@ -64,6 +66,8 @@ class SystemDesignReviewRequest:
 
         if proposal is None and not paths:
             raise ValidationError("Either proposal or paths must be provided")
+        if project_root is not None:
+            project_root = _require_non_blank(project_root, "project_root")
         constraints = _max_len(constraints, "constraints", 10_000)
         context = _max_len(context, "context", 10_000)
         if model is not None and model.strip() == "":
@@ -71,6 +75,7 @@ class SystemDesignReviewRequest:
         return SystemDesignReviewRequest(
             proposal=proposal,
             paths=paths,
+            project_root=project_root,
             constraints=constraints,
             context=context,
             model=model,
@@ -81,6 +86,7 @@ class SystemDesignReviewRequest:
 class CodeReviewRequest:
     code: str | None
     paths: list[str] | None
+    project_root: str | None
     language: str | None
     focus: str | None = None
     model: str | None = None
@@ -90,6 +96,7 @@ class CodeReviewRequest:
         *,
         code: str | None,
         paths: list[str] | None,
+        project_root: str | None,
         language: str | None,
         focus: str | None,
         model: str | None,
@@ -112,6 +119,9 @@ class CodeReviewRequest:
         if code is None and not paths:
             raise ValidationError("Either code or paths must be provided")
 
+        if project_root is not None:
+            project_root = _require_non_blank(project_root, "project_root")
+
         if language is not None:
             language = _require_non_blank(language, "language")
             if len(language) > 40:
@@ -126,4 +136,11 @@ class CodeReviewRequest:
         if model is not None and model.strip() == "":
             model = None
 
-        return CodeReviewRequest(code=code, paths=paths, language=language, focus=focus, model=model)
+        return CodeReviewRequest(
+            code=code,
+            paths=paths,
+            project_root=project_root,
+            language=language,
+            focus=focus,
+            model=model,
+        )

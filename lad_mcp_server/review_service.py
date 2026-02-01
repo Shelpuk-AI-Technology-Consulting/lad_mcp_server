@@ -99,18 +99,70 @@ class ReviewService:
             api_key=self._settings.openrouter_api_key,
             ttl_seconds=self._settings.openrouter_model_metadata_ttl_seconds,
         )
-        if repo_root is None:
-            env_root = os.getenv("LAD_REPO_ROOT")
-            if env_root and env_root.strip():
-                repo_root = Path(env_root)
-        self._repo_root = (repo_root or Path.cwd()).resolve()
-        self._file_context_builder = FileContextBuilder(repo_root=self._repo_root)
+        # NOTE: `repo_root` here is treated as a *default* only.
+        # The reviewed project should be selectable per tool invocation (via `project_root` or absolute-path inference),
+        # so Lad can be used across many projects with one MCP configuration.
+        self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
+
+    @staticmethod
+    def _walk_up_for_project_root(start: Path, *, max_depth: int = 25) -> Path:
+        """
+        Best-effort project root inference.
+
+        Priority:
+        - `.serena/` (enables Serena integration)
+        - `.git/` (common VCS marker)
+        Otherwise return the original `start`.
+        """
+        cur = start
+        for _ in range(max_depth):
+            if (cur / ".serena").is_dir():
+                return cur
+            if (cur / ".git").is_dir():
+                return cur
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        return start
+
+    def _resolve_project_root(self, *, project_root: str | None, paths: list[str] | None) -> Path:
+        # 1) Explicit per-call selection wins.
+        if project_root is not None and project_root.strip():
+            pr = Path(project_root).expanduser().resolve()
+            if pr.is_file():
+                pr = pr.parent
+            if not pr.exists() or not pr.is_dir():
+                raise ValidationError("project_root must be an existing directory")
+            return pr
+
+        # 2) Infer from absolute paths (so one Lad process can review multiple repos).
+        if paths:
+            abs_dirs: list[str] = []
+            for p in paths:
+                pp = Path(p)
+                if not pp.is_absolute():
+                    abs_dirs = []
+                    break
+                resolved = pp.expanduser().resolve()
+                if resolved.is_file():
+                    resolved = resolved.parent
+                abs_dirs.append(str(resolved))
+            if abs_dirs:
+                base = Path(os.path.commonpath(abs_dirs)).resolve()
+                if base.is_file():
+                    base = base.parent
+                if base.exists() and base.is_dir():
+                    return self._walk_up_for_project_root(base)
+
+        # 3) Service default (if any), otherwise current working directory at call time.
+        return (self._default_repo_root or Path.cwd()).resolve()
 
     async def system_design_review(self, **kwargs: Any) -> str:
         req = SystemDesignReviewRequest.validate(
             proposal=kwargs.get("proposal"),
             paths=kwargs.get("paths"),
+            project_root=kwargs.get("project_root"),
             constraints=kwargs.get("constraints"),
             context=kwargs.get("context"),
             model=kwargs.get("model"),
@@ -133,6 +185,7 @@ class ReviewService:
                     "context": req.context,
                 },
                 requested_paths=req.paths,
+                project_root=req.project_root,
                 override_model=req.model,
             )
 
@@ -142,6 +195,7 @@ class ReviewService:
         req = CodeReviewRequest.validate(
             code=kwargs.get("code"),
             paths=kwargs.get("paths"),
+            project_root=kwargs.get("project_root"),
             language=kwargs.get("language"),
             focus=kwargs.get("focus"),
             model=kwargs.get("model"),
@@ -159,6 +213,7 @@ class ReviewService:
                 ),
                 redaction_inputs={"code": req.code},
                 requested_paths=req.paths,
+                project_root=req.project_root,
                 override_model=req.model,
             )
 
@@ -172,6 +227,7 @@ class ReviewService:
         build_user_prompt: Any,
         redaction_inputs: dict[str, str | None],
         requested_paths: list[str] | None,
+        project_root: str | None,
         override_model: str | None,
     ) -> str:
         # Redact initial inputs (fail closed if redaction makes required content empty)
@@ -198,9 +254,12 @@ class ReviewService:
         primary_model = override_model or self._settings.openrouter_primary_reviewer_model
         secondary_model = override_model or self._settings.openrouter_secondary_reviewer_model
 
+        resolved_root = self._resolve_project_root(project_root=project_root, paths=requested_paths)
+        file_context_builder = FileContextBuilder(repo_root=resolved_root)
+
         # R8: If model metadata fetch fails, fail closed (no OpenRouter completion requests are sent).
-        primary_cfg = self._prepare_reviewer_config(primary_model)
-        secondary_cfg = self._prepare_reviewer_config(secondary_model)
+        primary_cfg = self._prepare_reviewer_config(primary_model, repo_root=resolved_root)
+        secondary_cfg = self._prepare_reviewer_config(secondary_model, repo_root=resolved_root)
 
         primary_task = asyncio.create_task(
             self._run_single_reviewer(
@@ -210,6 +269,7 @@ class ReviewService:
                 build_user_prompt=build_user_prompt,
                 redacted_inputs=redacted_inputs,
                 requested_paths=requested_paths,
+                file_context_builder=file_context_builder,
             )
         )
         secondary_task = asyncio.create_task(
@@ -220,6 +280,7 @@ class ReviewService:
                 build_user_prompt=build_user_prompt,
                 redacted_inputs=redacted_inputs,
                 requested_paths=requested_paths,
+                file_context_builder=file_context_builder,
             )
         )
 
@@ -278,7 +339,7 @@ class ReviewService:
             return f"Only Secondary review is available. Primary reviewer failed: {primary.error}"
         return f"Both reviewers failed.\n- Primary error: {primary.error}\n- Secondary error: {secondary.error}"
 
-    def _prepare_reviewer_config(self, model: str) -> ReviewerConfig:
+    def _prepare_reviewer_config(self, model: str, *, repo_root: Path) -> ReviewerConfig:
         try:
             meta = self._models.get_model(model)
             budget = TokenBudget(
@@ -298,7 +359,7 @@ class ReviewService:
         if tool_calling_supported:
             try:
                 serena_ctx = SerenaContext.detect(
-                    self._repo_root,
+                    repo_root,
                     SerenaLimits(
                         max_dir_entries=self._settings.lad_serena_max_dir_entries,
                         max_search_results=self._settings.lad_serena_max_search_results,
@@ -311,7 +372,7 @@ class ReviewService:
                 # R9: if Serena integration is enabled (via `.serena/`) but fails, fail closed.
                 raise RuntimeError(f"Serena integration initialization failed: {exc}") from exc
 
-            if serena_ctx is None and (self._repo_root / ".serena").is_dir():
+            if serena_ctx is None and (repo_root / ".serena").is_dir():
                 # `.serena/` exists but context could not be enabled; treat as failure per R9.
                 raise RuntimeError("Serena integration required but could not be enabled")
             if serena_ctx is None:
@@ -338,6 +399,7 @@ class ReviewService:
         build_user_prompt: Any,
         redacted_inputs: dict[str, str],
         requested_paths: list[str] | None,
+        file_context_builder: FileContextBuilder,
     ) -> ReviewerOutcome:
         model = cfg.model
         budget = cfg.budget
@@ -358,7 +420,7 @@ class ReviewService:
             buffer = 600
             remaining_for_files = max(max_user_chars - len(user_prompt) - buffer, 0)
             if remaining_for_files > 0:
-                file_ctx = self._file_context_builder.build(paths=requested_paths, max_chars=remaining_for_files)
+                file_ctx = file_context_builder.build(paths=requested_paths, max_chars=remaining_for_files)
 
                 embedded_list = "\n".join(f"- `{p}`" for p in file_ctx.embedded_files) or "- (none)"
                 skipped_list = "\n".join(
