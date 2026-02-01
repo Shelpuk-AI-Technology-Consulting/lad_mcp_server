@@ -21,7 +21,7 @@ def system_prompt_system_design_review(*, tool_calling_enabled: bool) -> str:
     )
     return (
         "You are an expert software architect and reviewer.\n"
-        "Provide a thorough but concise critique.\n"
+        "Provide a thorough but concise critique of the proposed solution. Spot any issues, bugs, inconsistencies, failure modes, and corner cases.\n"
         f"{tool_note}\n"
         f"{serena_preflight}\n"
         "Return Markdown with sections:\n"
@@ -60,7 +60,7 @@ def system_prompt_code_review(*, tool_calling_enabled: bool) -> str:
         else ""
     )
     return (
-        "You are an expert code reviewer focused on correctness, security, and maintainability.\n"
+        "You are an expert code reviewer focused on correctness, security, and maintainability. You spot any issues, bugs, inconsistencies, failure modes, and corner cases.\n"
         f"{tool_note}\n"
         f"{serena_preflight}\n"
         "Return Markdown with sections:\n"
