@@ -59,14 +59,15 @@ def system_prompt_code_review(*, tool_calling_enabled: bool) -> str:
     )
 
 
-def user_prompt_code_review(*, code: str, language: str, focus: str | None) -> str:
-    focus_text = focus or "general"
+def user_prompt_code_review(*, code: str) -> str:
     return (
         "# Code Review Request\n"
-        f"\n## Language\n{language}\n"
-        f"\n## Focus\n{focus_text}\n"
+        "\n## Language\n"
+        "Infer language(s) and frameworks from the code and embedded file paths/extensions.\n"
+        "\n## Review Goal\n"
+        "Find bugs, untracked failure modes, gaps or contradictions in business logic, and provide concrete improvement suggestions.\n"
         "\n## Code\n"
-        f"```{language}\n{code}\n```\n"
+        f"```\n{code}\n```\n"
     )
 
 

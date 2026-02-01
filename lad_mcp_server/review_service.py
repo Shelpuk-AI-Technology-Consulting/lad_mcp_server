@@ -100,8 +100,8 @@ class ReviewService:
             ttl_seconds=self._settings.openrouter_model_metadata_ttl_seconds,
         )
         # NOTE: `repo_root` here is treated as a *default* only.
-        # The reviewed project should be selectable per tool invocation (via `project_root` or absolute-path inference),
-        # so Lad can be used across many projects with one MCP configuration.
+        # The reviewed project is inferred per tool invocation (prefer CODEX_WORKSPACE_ROOT; otherwise absolute-path
+        # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
         self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
 
@@ -126,15 +126,13 @@ class ReviewService:
             cur = cur.parent
         return start
 
-    def _resolve_project_root(self, *, project_root: str | None, paths: list[str] | None) -> Path:
-        # 1) Explicit per-call selection wins.
-        if project_root is not None and project_root.strip():
-            pr = Path(project_root).expanduser().resolve()
-            if pr.is_file():
-                pr = pr.parent
-            if not pr.exists() or not pr.is_dir():
-                raise ValidationError("project_root must be an existing directory")
-            return pr
+    def _resolve_project_root(self, *, paths: list[str] | None) -> Path:
+        # 1) Codex provides a workspace root for the current session.
+        codex_root = os.getenv("CODEX_WORKSPACE_ROOT")
+        if codex_root and codex_root.strip():
+            pr = Path(codex_root).expanduser().resolve()
+            if pr.exists() and pr.is_dir():
+                return pr
 
         # 2) Infer from absolute paths (so one Lad process can review multiple repos).
         if paths:
@@ -162,10 +160,8 @@ class ReviewService:
         req = SystemDesignReviewRequest.validate(
             proposal=kwargs.get("proposal"),
             paths=kwargs.get("paths"),
-            project_root=kwargs.get("project_root"),
             constraints=kwargs.get("constraints"),
             context=kwargs.get("context"),
-            model=kwargs.get("model"),
             max_input_chars=self._settings.openrouter_max_input_chars,
         )
 
@@ -185,8 +181,6 @@ class ReviewService:
                     "context": req.context,
                 },
                 requested_paths=req.paths,
-                project_root=req.project_root,
-                override_model=req.model,
             )
 
         return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
@@ -195,10 +189,6 @@ class ReviewService:
         req = CodeReviewRequest.validate(
             code=kwargs.get("code"),
             paths=kwargs.get("paths"),
-            project_root=kwargs.get("project_root"),
-            language=kwargs.get("language"),
-            focus=kwargs.get("focus"),
-            model=kwargs.get("model"),
             max_input_chars=self._settings.openrouter_max_input_chars,
         )
 
@@ -208,13 +198,9 @@ class ReviewService:
                 build_system_prompt=system_prompt_code_review,
                 build_user_prompt=lambda tool_calling_enabled, redacted: user_prompt_code_review(
                     code=redacted.get("code") or "(No code snippet provided. Use the embedded files below.)",
-                    language=req.language or "mixed",
-                    focus=req.focus,
                 ),
                 redaction_inputs={"code": req.code},
                 requested_paths=req.paths,
-                project_root=req.project_root,
-                override_model=req.model,
             )
 
         return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
@@ -227,8 +213,6 @@ class ReviewService:
         build_user_prompt: Any,
         redaction_inputs: dict[str, str | None],
         requested_paths: list[str] | None,
-        project_root: str | None,
-        override_model: str | None,
     ) -> str:
         # Redact initial inputs (fail closed if redaction makes required content empty)
         redacted_inputs: dict[str, str] = {}
@@ -251,10 +235,10 @@ class ReviewService:
             if redaction_inputs.get("code") is None and not requested_paths:
                 raise ValidationError("Either code or paths must be provided")
 
-        primary_model = override_model or self._settings.openrouter_primary_reviewer_model
-        secondary_model = override_model or self._settings.openrouter_secondary_reviewer_model
+        primary_model = self._settings.openrouter_primary_reviewer_model
+        secondary_model = self._settings.openrouter_secondary_reviewer_model
 
-        resolved_root = self._resolve_project_root(project_root=project_root, paths=requested_paths)
+        resolved_root = self._resolve_project_root(paths=requested_paths)
         file_context_builder = FileContextBuilder(repo_root=resolved_root)
 
         # R8: If model metadata fetch fails, fail closed (no OpenRouter completion requests are sent).

@@ -15,7 +15,7 @@ Lad ships a stdio CLI entrypoint: `lad-mcp-server`.
 - One-off run from git (works well for MCP hosts launching tools via `uvx`):
   - `uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server`
 
-Tip: `uvx` runs tools in an isolated environment; pass `project_root` in each tool call so Lad knows which repo to read.
+Tip: `uvx` runs tools in an isolated environment; Lad infers the project root from the MCP host (or absolute paths, or CWD).
 
 ## Codex setup (CLI-only)
 
@@ -41,7 +41,7 @@ codex mcp add lad `
   -- uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server
 ```
 
-Per-project usage: pass `project_root` and `paths` in each tool call (recommended when one Codex config is used across many repos). If `project_root` is omitted, Lad falls back to the server process CWD (or infers from absolute `paths`).
+Per-project usage: use `paths` from the project you want reviewed. Lad infers the project root from the MCP host (or from absolute `paths`, or finally from CWD).
 
 ## Configuration (environment variables)
 
@@ -57,12 +57,12 @@ Common:
 
 ## Path-based review requests
 
-Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dirs under `project_root` / inferred absolute `paths` / CWD). When `paths` are provided, Lad reads and embeds **text-like** files from disk (language-agnostic) and skips common binary files and oversized files.
+Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dirs under inferred project root). When `paths` are provided, Lad reads and embeds **text-like** files from disk (language-agnostic) and skips common binary files and oversized files.
 During directory expansion, hidden files and directories (dotfiles) are skipped; pass an explicit path (e.g., `.gitignore`) if you want it included.
 
 Example tool payloads:
 - `system_design_review`: `{\"paths\":[\"research/AI Code Review MCP Server Design.md\"],\"constraints\":\"...\"}`
-- `code_review`: `{\"paths\":[\"lad_mcp_server\",\"tests\"],\"focus\":\"security\",\"language\":\"mixed\"}`
+- `code_review`: `{\"paths\":[\"lad_mcp_server\",\"tests\"]}`
 
 ## Serena integration
 

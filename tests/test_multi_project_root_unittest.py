@@ -84,26 +84,8 @@ class TestMultiProjectRoot(unittest.TestCase):
             (repo1 / "a.txt").write_text("repo1\n", encoding="utf-8")
             (repo2 / "a.txt").write_text("repo2\n", encoding="utf-8")
 
-            asyncio.run(
-                service.code_review(
-                    code=None,
-                    paths=["a.txt"],
-                    project_root=str(repo1),
-                    language=None,
-                    focus=None,
-                    model=None,
-                )
-            )
-            asyncio.run(
-                service.code_review(
-                    code=None,
-                    paths=["a.txt"],
-                    project_root=str(repo2),
-                    language=None,
-                    focus=None,
-                    model=None,
-                )
-            )
+            asyncio.run(service.code_review(code=None, paths=[str(repo1 / "a.txt")]))
+            asyncio.run(service.code_review(code=None, paths=[str(repo2 / "a.txt")]))
 
         joined = "\n\n---\n\n".join(capture.user_messages)
         self.assertIn("--- BEGIN FILE: a.txt", joined)
@@ -113,4 +95,3 @@ class TestMultiProjectRoot(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

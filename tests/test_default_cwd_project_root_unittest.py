@@ -39,7 +39,7 @@ class _OpenRouterCaptureStub:
 
 
 class TestDefaultCwdProjectRoot(unittest.TestCase):
-    def test_cwd_is_used_when_project_root_is_not_provided(self) -> None:
+    def test_cwd_is_used_when_no_other_root_is_available(self) -> None:
         primary = "moonshotai/kimi-k2-thinking"
         meta = ModelMetadata(
             model_id=primary,
@@ -92,10 +92,6 @@ class TestDefaultCwdProjectRoot(unittest.TestCase):
                     service.code_review(
                         code=None,
                         paths=["hello.js"],
-                        project_root=None,
-                        language=None,
-                        focus=None,
-                        model=None,
                     )
                 )
             finally:
