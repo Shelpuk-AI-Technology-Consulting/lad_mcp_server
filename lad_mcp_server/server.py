@@ -29,7 +29,7 @@ def create_app() -> Any:
     @mcp.tool()
     async def system_design_review(
         proposal: str | None = None,
-        paths: list[str] | None = None,
+        paths: list[str] | str | None = None,
         constraints: str | None = None,
         context: str | None = None,
     ) -> str:
@@ -51,7 +51,7 @@ def create_app() -> Any:
     @mcp.tool()
     async def code_review(
         code: str | None = None,
-        paths: list[str] | None = None,
+        paths: list[str] | str | None = None,
     ) -> str:
         """
         Review a code snippet or diff using two LLM reviewers in parallel.

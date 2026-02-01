@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 
@@ -23,6 +24,35 @@ def _max_len(value: str | None, field_name: str, max_chars: int) -> str | None:
     return value
 
 
+def _normalize_paths(paths: list[str] | str | None) -> list[str] | None:
+    if paths is None:
+        return None
+
+    if isinstance(paths, str):
+        s = paths.strip()
+        if s == "":
+            raise ValidationError("paths must be a non-empty list of strings when provided")
+        # If the caller passed a JSON array as a string, try to parse it.
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+            except Exception as exc:
+                raise ValidationError(f"paths JSON could not be parsed: {exc}") from exc
+            paths = parsed
+        else:
+            # Common failure mode: newline-separated list (e.g., copied from a UI textarea).
+            paths = [p.strip() for p in s.splitlines() if p.strip()]
+
+    if not isinstance(paths, list) or len(paths) == 0:
+        raise ValidationError("paths must be a non-empty list of strings when provided")
+
+    cleaned: list[str] = []
+    for p in paths:
+        p = _require_non_blank(p, "paths[]")
+        cleaned.append(p)
+    return cleaned
+
+
 @dataclass(frozen=True)
 class SystemDesignReviewRequest:
     proposal: str | None
@@ -34,7 +64,7 @@ class SystemDesignReviewRequest:
     def validate(
         *,
         proposal: str | None,
-        paths: list[str] | None,
+        paths: list[str] | str | None,
         constraints: str | None,
         context: str | None,
         max_input_chars: int,
@@ -46,14 +76,7 @@ class SystemDesignReviewRequest:
             if len(proposal) > max_input_chars:
                 raise ValidationError(f"proposal must be <= OPENROUTER_MAX_INPUT_CHARS ({max_input_chars})")
 
-        if paths is not None:
-            if not isinstance(paths, list) or len(paths) == 0:
-                raise ValidationError("paths must be a non-empty list of strings when provided")
-            cleaned: list[str] = []
-            for p in paths:
-                p = _require_non_blank(p, "paths[]")
-                cleaned.append(p)
-            paths = cleaned
+        paths = _normalize_paths(paths)
 
         if proposal is None and not paths:
             raise ValidationError("Either proposal or paths must be provided")
@@ -76,7 +99,7 @@ class CodeReviewRequest:
     def validate(
         *,
         code: str | None,
-        paths: list[str] | None,
+        paths: list[str] | str | None,
         max_input_chars: int,
     ) -> "CodeReviewRequest":
         if code is not None:
@@ -84,19 +107,12 @@ class CodeReviewRequest:
             if len(code) > max_input_chars:
                 raise ValidationError(f"code must be <= OPENROUTER_MAX_INPUT_CHARS ({max_input_chars})")
 
-        if paths is not None:
-            if not isinstance(paths, list) or len(paths) == 0:
-                raise ValidationError("paths must be a non-empty list of strings when provided")
-            cleaned_paths: list[str] = []
-            for p in paths:
-                p = _require_non_blank(p, "paths[]")
-                cleaned_paths.append(p)
-            paths = cleaned_paths
+        normalized_paths = _normalize_paths(paths)
 
-        if code is None and not paths:
+        if code is None and not normalized_paths:
             raise ValidationError("Either code or paths must be provided")
 
         return CodeReviewRequest(
             code=code,
-            paths=paths,
+            paths=normalized_paths,
         )
