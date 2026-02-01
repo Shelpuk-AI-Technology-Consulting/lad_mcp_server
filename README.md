@@ -51,6 +51,7 @@ Required:
 Common:
 - `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2-thinking`)
 - `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `z-ai/glm-4.7`)
+  - Set to `0` to disable the Secondary reviewer (Primary-only mode).
 - `OPENROUTER_REVIEWER_TIMEOUT_SECONDS` (default: `180`, per reviewer)
 - `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `240`, per tool call)
 - `LAD_ENV_FILE` (optional `KEY=VALUE` file, loaded only for missing vars)
@@ -63,6 +64,10 @@ During directory expansion, hidden files and directories (dotfiles) are skipped;
 Example tool payloads:
 - `system_design_review`: `{\"paths\":[\"research/AI Code Review MCP Server Design.md\"],\"constraints\":\"...\"}`
 - `code_review`: `{\"paths\":[\"lad_mcp_server\",\"tests\"]}`
+
+Notes:
+- For multi-project usage (one Lad config for many repos), prefer **absolute** `paths`. Relative `paths` work when the MCP host starts Lad with CWD set to the project root (or when the host provides a workspace root).
+- For safety, Lad rejects path-based reviews that resolve to obvious system roots (e.g. `/etc`, `/proc`, `C:\\Windows`).
 
 ## Serena integration
 

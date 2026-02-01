@@ -22,7 +22,16 @@ class TestMarkdown(unittest.TestCase):
         self.assertIn("## Secondary Reviewer", out)
         self.assertIn("## Synthesized Summary", out)
 
+    def test_aggregated_structure_primary_only(self) -> None:
+        out = format_aggregated_output(
+            primary_markdown="## Summary\nA",
+            secondary_markdown=None,
+            synthesized_summary="S",
+        )
+        self.assertIn("## Primary Reviewer", out)
+        self.assertNotIn("## Secondary Reviewer", out)
+        self.assertIn("## Synthesized Summary", out)
+
 
 if __name__ == "__main__":
     unittest.main()
-

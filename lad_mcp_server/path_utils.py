@@ -10,6 +10,68 @@ def _looks_like_windows_absolute(path_str: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:[\\/]", path_str)) or path_str.startswith("\\\\")
 
 
+def _is_filesystem_root(path: Path) -> bool:
+    resolved = path.resolve()
+    return resolved.parent == resolved
+
+
+def is_dangerous_repo_root(repo_root: Path) -> bool:
+    """
+    Best-effort guard against reviewing arbitrary system directories.
+
+    This is intentionally conservative: Lad should be usable across many repos, but path-based
+    reviews should not allow embedding from locations like /etc or C:\\Windows.
+    """
+    root = repo_root.resolve()
+
+    if _is_filesystem_root(root):
+        return True
+
+    # Avoid allowing "home directory root" as a project root (too broad).
+    try:
+        home = Path.home().resolve()
+        if root == home:
+            return True
+    except Exception:
+        # If home cannot be resolved, skip this check.
+        pass
+
+    if os.name == "nt":
+        # Drive root (e.g., C:\) is always too broad.
+        if root.parent == root:
+            return True
+
+        windir = Path(os.environ.get("WINDIR", r"C:\Windows")).resolve()
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files")).resolve()
+        program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")).resolve()
+        program_data = Path(os.environ.get("ProgramData", r"C:\ProgramData")).resolve()
+
+        blocked_prefixes = (windir, program_files, program_files_x86, program_data)
+    else:
+        blocked_prefixes = (
+            Path("/etc"),
+            Path("/proc"),
+            Path("/sys"),
+            Path("/dev"),
+            Path("/run"),
+            Path("/var"),
+            Path("/bin"),
+            Path("/sbin"),
+            Path("/lib"),
+            Path("/lib64"),
+            Path("/boot"),
+        )
+
+    for prefix in blocked_prefixes:
+        try:
+            root.relative_to(prefix)
+            return True
+        except ValueError:
+            continue
+
+    return False
+
+
 def safe_resolve_under_repo(*, repo_root: Path, path_str: str) -> Path:
     """
     Resolve `path_str` (absolute or repo-relative) and ensure it stays under `repo_root`.
@@ -45,4 +107,3 @@ def safe_resolve_under_repo(*, repo_root: Path, path_str: str) -> Path:
         raise ValueError("path is outside repo root")
 
     return resolved
-

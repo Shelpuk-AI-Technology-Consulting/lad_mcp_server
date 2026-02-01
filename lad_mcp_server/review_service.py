@@ -15,6 +15,7 @@ from lad_mcp_server.file_context import FileContextBuilder
 from lad_mcp_server.markdown import final_egress_redaction, format_aggregated_output
 from lad_mcp_server.model_metadata import ModelMetadataError, OpenRouterModelsClient
 from lad_mcp_server.openrouter_client import OpenRouterClient, OpenRouterClientError
+from lad_mcp_server.path_utils import is_dangerous_repo_root
 from lad_mcp_server.prompts import (
     force_finalize_system_message,
     system_prompt_code_review,
@@ -237,13 +238,20 @@ class ReviewService:
 
         primary_model = self._settings.openrouter_primary_reviewer_model
         secondary_model = self._settings.openrouter_secondary_reviewer_model
+        secondary_enabled = secondary_model != "0"
 
         resolved_root = self._resolve_project_root(paths=requested_paths)
+        if requested_paths and is_dangerous_repo_root(resolved_root):
+            raise ValidationError(
+                "paths resolve to an unsafe project root; provide paths under a real repository directory"
+            )
         file_context_builder = FileContextBuilder(repo_root=resolved_root)
 
         # R8: If model metadata fetch fails, fail closed (no OpenRouter completion requests are sent).
         primary_cfg = self._prepare_reviewer_config(primary_model, repo_root=resolved_root)
-        secondary_cfg = self._prepare_reviewer_config(secondary_model, repo_root=resolved_root)
+        secondary_cfg = (
+            self._prepare_reviewer_config(secondary_model, repo_root=resolved_root) if secondary_enabled else None
+        )
 
         primary_task = asyncio.create_task(
             self._run_single_reviewer(
@@ -256,6 +264,17 @@ class ReviewService:
                 file_context_builder=file_context_builder,
             )
         )
+
+        if not secondary_enabled or secondary_cfg is None:
+            primary = await primary_task
+            synthesized = self._synthesize(primary, None)
+            aggregated = format_aggregated_output(
+                primary_markdown=self._append_disclosure(primary),
+                secondary_markdown=None,
+                synthesized_summary=synthesized,
+            )
+            return final_egress_redaction(aggregated)
+
         secondary_task = asyncio.create_task(
             self._run_single_reviewer(
                 cfg=secondary_cfg,
@@ -302,7 +321,12 @@ class ReviewService:
             lines.append(f"*Serena note: {outcome.serena_disabled_reason}*")
         return outcome.markdown.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
-    def _synthesize(self, primary: ReviewerOutcome, secondary: ReviewerOutcome) -> str:
+    def _synthesize(self, primary: ReviewerOutcome, secondary: ReviewerOutcome | None) -> str:
+        if secondary is None:
+            if primary.ok:
+                return "Only Primary review is provided (secondary reviewer disabled)."
+            return f"Primary reviewer failed: {primary.error}"
+
         if primary.ok and secondary.ok:
             notes = []
             if primary.used_serena:

@@ -8,8 +8,14 @@ def system_prompt_system_design_review(*, tool_calling_enabled: bool) -> str:
         else "You do NOT have access to any tools or repository context beyond the user-provided text."
     )
     serena_preflight = (
-        "PRE-FLIGHT (mandatory): Immediately call `activate_project` with `project=\".\"` before any other tool. "
-        "Then call `read_project_overview` to load baseline project context.\n"
+        "SERENA WORKFLOW (mandatory):\n"
+        "1) Immediately call `activate_project` with `project=\".\"` before any other tool.\n"
+        "2) Call `read_project_overview` to load baseline project context.\n"
+        "3) Call `list_memories`, then read the most relevant memories via `read_memory`:\n"
+        "   - Always try: `project_overview`, `research_summary`\n"
+        "   - If present: requirements/design constraints memories (e.g., `requirements`, `constraints`)\n"
+        "4) If requirements/constraints are not in Serena memories, read `REQUIREMENTS.md` / `README.md` via `read_file`.\n"
+        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`).\n"
         if tool_calling_enabled
         else ""
     )
@@ -42,8 +48,14 @@ def system_prompt_code_review(*, tool_calling_enabled: bool) -> str:
         else "You do NOT have access to any tools or repository context beyond the user-provided text."
     )
     serena_preflight = (
-        "PRE-FLIGHT (mandatory): Immediately call `activate_project` with `project=\".\"` before any other tool. "
-        "Then call `read_project_overview` to load baseline project context.\n"
+        "SERENA WORKFLOW (mandatory):\n"
+        "1) Immediately call `activate_project` with `project=\".\"` before any other tool.\n"
+        "2) Call `read_project_overview` to load baseline project context.\n"
+        "3) Call `list_memories`, then read the most relevant memories via `read_memory`:\n"
+        "   - Always try: `project_overview`, `research_summary`\n"
+        "   - If present: requirements/design constraints memories (e.g., `requirements`, `constraints`)\n"
+        "4) If requirements/constraints are not in Serena memories, read `REQUIREMENTS.md` / `README.md` via `read_file`.\n"
+        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`).\n"
         if tool_calling_enabled
         else ""
     )
