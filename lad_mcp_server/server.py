@@ -52,6 +52,7 @@ def create_app() -> Any:
     async def code_review(
         code: str | None = None,
         paths: list[str] | str | None = None,
+        context: str | None = None,
     ) -> str:
         """
         Review a code snippet or diff using two LLM reviewers in parallel.
@@ -60,6 +61,7 @@ def create_app() -> Any:
             return await service.code_review(
                 code=code,
                 paths=paths,
+                context=context,
             )
         except ValidationError as exc:
             return format_validation_error(str(exc))

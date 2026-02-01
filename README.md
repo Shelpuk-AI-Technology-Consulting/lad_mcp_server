@@ -63,7 +63,7 @@ During directory expansion, hidden files and directories (dotfiles) are skipped;
 
 Example tool payloads:
 - `system_design_review`: `{\"paths\":[\"research/AI Code Review MCP Server Design.md\"],\"constraints\":\"...\"}`
-- `code_review`: `{\"paths\":[\"lad_mcp_server\",\"tests\"]}`
+- `code_review`: `{\"paths\":[\"lad_mcp_server\",\"tests\"],\"context\":\"Please prioritize correctness and failure modes in auth/session logic.\"}`
 
 Notes:
 - For multi-project usage (one Lad config for many repos), prefer **absolute** `paths`. Relative `paths` work when the MCP host starts Lad with CWD set to the project root (or when the host provides a workspace root).

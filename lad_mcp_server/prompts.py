@@ -71,13 +71,17 @@ def system_prompt_code_review(*, tool_calling_enabled: bool) -> str:
     )
 
 
-def user_prompt_code_review(*, code: str) -> str:
+def user_prompt_code_review(*, code: str, context: str | None) -> str:
+    context_block = ""
+    if context:
+        context_block = "\n## Context / Goals\n" + context + "\n"
     return (
         "# Code Review Request\n"
         "\n## Language\n"
         "Infer language(s) and frameworks from the code and embedded file paths/extensions.\n"
         "\n## Review Goal\n"
         "Find bugs, untracked failure modes, gaps or contradictions in business logic, and provide concrete improvement suggestions.\n"
+        f"{context_block}"
         "\n## Code\n"
         f"```\n{code}\n```\n"
     )

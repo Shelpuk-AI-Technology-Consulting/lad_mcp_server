@@ -190,6 +190,7 @@ class ReviewService:
         req = CodeReviewRequest.validate(
             code=kwargs.get("code"),
             paths=kwargs.get("paths"),
+            context=kwargs.get("context"),
             max_input_chars=self._settings.openrouter_max_input_chars,
         )
 
@@ -199,8 +200,9 @@ class ReviewService:
                 build_system_prompt=system_prompt_code_review,
                 build_user_prompt=lambda tool_calling_enabled, redacted: user_prompt_code_review(
                     code=redacted.get("code") or "(No code snippet provided. Use the embedded files below.)",
+                    context=redacted.get("context"),
                 ),
-                redaction_inputs={"code": req.code},
+                redaction_inputs={"code": req.code, "context": req.context},
                 requested_paths=req.paths,
             )
 

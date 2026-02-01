@@ -94,12 +94,14 @@ class SystemDesignReviewRequest:
 class CodeReviewRequest:
     code: str | None
     paths: list[str] | None
+    context: str | None = None
 
     @staticmethod
     def validate(
         *,
         code: str | None,
         paths: list[str] | str | None,
+        context: str | None = None,
         max_input_chars: int,
     ) -> "CodeReviewRequest":
         if code is not None:
@@ -108,6 +110,7 @@ class CodeReviewRequest:
                 raise ValidationError(f"code must be <= OPENROUTER_MAX_INPUT_CHARS ({max_input_chars})")
 
         normalized_paths = _normalize_paths(paths)
+        context = _max_len(context, "context", 10_000)
 
         if code is None and not normalized_paths:
             raise ValidationError("Either code or paths must be provided")
@@ -115,4 +118,5 @@ class CodeReviewRequest:
         return CodeReviewRequest(
             code=code,
             paths=normalized_paths,
+            context=context,
         )

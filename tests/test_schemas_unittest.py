@@ -44,6 +44,15 @@ class TestSchemas(unittest.TestCase):
         )
         self.assertEqual(req.paths, ["lad_mcp_server/server.py"])
 
+    def test_code_review_accepts_context(self) -> None:
+        req = CodeReviewRequest.validate(
+            code="print('hi')\n",
+            paths=None,
+            context="Please focus on edge cases and error handling.",
+            max_input_chars=10_000,
+        )
+        self.assertEqual(req.context, "Please focus on edge cases and error handling.")
+
     def test_code_review_accepts_newline_separated_paths_string(self) -> None:
         req = CodeReviewRequest.validate(
             code=None,
