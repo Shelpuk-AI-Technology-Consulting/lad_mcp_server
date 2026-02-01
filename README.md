@@ -17,9 +17,31 @@ Lad ships a stdio CLI entrypoint: `lad-mcp-server`.
 
 Tip: `uvx` runs tools in an isolated environment; set `LAD_REPO_ROOT` so Lad knows which repo to read.
 
-## Install Codex CLI (optional, one-liner)
+## Codex setup (CLI-only)
 
-`npm i -g @openai/codex`
+Install Codex CLI (one-liner):
+
+```bash
+npm i -g @openai/codex
+```
+
+Add Lad as a local stdio MCP server (macOS / Linux):
+
+```bash
+codex mcp add lad \
+  --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+  --env LAD_REPO_ROOT="/absolute/path/to/the/repo-you-want-reviewed" \
+  -- uvx --from git+https://github.com/<you>/<repo>.git lad-mcp-server
+```
+
+Windows (PowerShell):
+
+```powershell
+codex mcp add lad `
+  --env OPENROUTER_API_KEY="$env:OPENROUTER_API_KEY" `
+  --env LAD_REPO_ROOT="D:\Path\To\Repo\To\Review" `
+  -- uvx --from git+https://github.com/<you>/<repo>.git lad-mcp-server
+```
 
 ## Configuration (environment variables)
 
