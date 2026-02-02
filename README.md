@@ -58,21 +58,29 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 ### Zero-config OpenRouter integration
 
 ✅ Lad fetches model metadata (context window size, tool calling support) directly from OpenRouter via the OpenRouter API.
+
 ✅ If a model is available on OpenRouter, Lad can use it – **no manual configuration needed**.
+
 ✅ New models? They just work.
 
 ### Dual-reviewer mode by default
 
 ✅ Lad runs **two reviewers in parallel** (default: `moonshotai/kimi-k2-thinking` and `z-ai/glm-4.7`)
+
 ✅ Reduces individual model bias and catches more issues
+
 ✅ Returns both reviews plus a synthesized summary
+
 ✅ You can switch to single-reviewer mode with `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`
 
 ### Project-aware review (the killer feature)
 
 ✅ Lad integrates with **Serena** – a "headless IDE" for AI coding agents
+
 ✅ Serena provides token-efficient project indexing and persistent "memories"
+
 ✅ Your agents can record requirements, design decisions, debug findings, and more
+
 ✅ Memories survive across coding sessions and can be shared across teams
 
 *(Disclaimer: We are not affiliated with Serena in any way.)*
@@ -88,7 +96,9 @@ This is what human reviewers do – and now your AI reviewer can too.
 ### Workflow integration
 
 ✅ **`system_design_review`** for planning and architectural decisions
+
 ✅ **`code_review`** for implementation and diffs
+
 ✅ Both tools support text input **and** file references via `paths` – no need to regenerate code for review
 
 ### Works everywhere
@@ -108,8 +118,11 @@ If you give it a try or like the idea, please drop us a star on GitHub – it's 
 Lad eliminates the need for:
 
 ✅ Manual OpenRouter model configuration
+
 ✅ Context-blind AI code reviewers
+
 ✅ Separate tools for design review vs. code review
+
 ✅ Constantly re-explaining requirements to reviewers
 
 ## Tools
