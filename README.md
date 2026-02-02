@@ -75,7 +75,9 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 
 ### Project-aware review (the killer feature)
 
-✅ Lad integrates with **Serena** – a "headless IDE" for AI coding agents
+**Note:** This feature is **optional** – Lad works perfectly fine without Serena for basic code review. However, if you want project-aware review with long-term memory and codebase indexing, Serena integration provides significant advantages.
+
+✅ Lad can integrate with **Serena** – a "headless IDE" for AI coding agents
 
 ✅ Serena provides token-efficient project indexing and persistent "memories"
 
@@ -85,13 +87,15 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 
 *(Disclaimer: We are not affiliated with Serena in any way.)*
 
-**Here's the magic:** Lad connects your Serena repository index and memories to the reviewer LLMs. Now the reviewing agent can:
+**Here's the magic when Serena is available:** Lad connects your Serena repository index and memories to the reviewer LLMs. Now the reviewing agent can:
 - Spot inconsistencies with other system modules
 - Catch mismatches with requirements settled months ago
 - Reference design decisions from your project's memory bank
 - Review code in the context of your **entire project history**, not just the diff
 
 This is what human reviewers do – and now your AI reviewer can too.
+
+**Without Serena:** Lad still provides excellent dual-reviewer code analysis, but reviews will be based solely on the code you submit, without access to project history, requirements, or architectural context.
 
 ### Workflow integration
 
@@ -412,7 +416,9 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 - `OPENROUTER_MAX_INPUT_CHARS` (default: `100000`)
 - `OPENROUTER_INCLUDE_REASONING` (default: `false`)
 
-### Serena bridge (only when `.serena/` exists and tool calling is supported)
+### Serena bridge (optional – only when `.serena/` exists and tool calling is supported)
+
+**Note:** These variables are only used when Serena integration is active. You don't need to set them if you're not using Serena.
 
 - `LAD_SERENA_MAX_TOOL_CALLS` (default: `8`)
 - `LAD_SERENA_TOOL_TIMEOUT_SECONDS` (default: `30`)
@@ -442,9 +448,14 @@ Notes:
 - For multi-project usage (one Lad config for many repos), prefer **absolute** `paths`. Relative `paths` work when the MCP host starts Lad with CWD set to the project root (or when the host provides a workspace root).
 - For safety, Lad rejects path-based reviews that resolve to obvious system roots (e.g. `/etc`, `/proc`, `C:\Windows`).
 
-## Serena integration
+## Serena integration (optional)
 
-If the repo being reviewed contains `.serena/` and the model supports tool calling, both reviewers get a read-only Serena toolset (directory listing, file reads, memory reads, pattern search) and are instructed/forced to call `activate_project(".")` first.
+**Serena is completely optional.** Lad works without Serena and will perform code reviews based on the code you provide. However, without Serena, reviewers won't have access to:
+- Long-term project memory (requirements, design decisions, debug notes)
+- Codebase index for exploring related modules
+- Historical context from previous coding sessions
+
+**If Serena is available:** When the repo being reviewed contains `.serena/` and the model supports tool calling, both reviewers automatically get a read-only Serena toolset (directory listing, file reads, memory reads, pattern search) and are instructed to call `activate_project(".")` first. This enables project-aware reviews with full context.
 
 ## Docker deployment (local stdio)
 
