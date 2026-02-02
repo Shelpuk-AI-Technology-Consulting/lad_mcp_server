@@ -1,0 +1,14 @@
+.git
+.idea
+.serena
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+tests
+research
+scripts
+*.egg-info
+
