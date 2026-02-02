@@ -6,7 +6,7 @@
 
 ## Why review AI-generated code with another AI?
 
-Picture this: Your coding agent just spent 20 minutes refactoring your authentication module. The code looks clean, passes tests, and the agent is confident. You merge it. Three days later, you discover it breaks the SSO integration that was documented in a design decision from two months ago—a decision the agent never saw.
+Picture this: Your coding agent just spent 20 minutes refactoring your authentication module. The code looks clean, passes tests, and the agent is confident. You merge it. Three days later, you discover it breaks the SSO integration that was documented in a design decision from two months ago – a decision the agent never saw.
 
 This isn't a bug in the code. It's a bug in the **context**.
 
@@ -14,15 +14,15 @@ This isn't a bug in the code. It's a bug in the **context**.
 
 LLMs generate text token by token. Each new token is chosen to maximize coherence with all previous tokens. So when an agent makes a questionable design choice early on, every subsequent token tries to justify and reinforce that mistake to maintain cohesion. The agent effectively **gaslights itself**.
 
-Think of it like this: if you start a sentence with a wrong assumption, your brain automatically tries to make the rest of the sentence sound convincing—even if the premise is flawed. LLMs do the same thing, but they can't step back and question their earlier choices.
+Think of it like this: if you start a sentence with a wrong assumption, your brain automatically tries to make the rest of the sentence sound convincing – even if the premise is flawed. LLMs do the same thing, but they can't step back and question their earlier choices.
 
-When generating large code segments, "if" the agent makes a bad choice becomes "**when**"—it's statistically inevitable.
+When generating large code segments, "if" the agent makes a bad choice becomes "**when**" – it's statistically inevitable.
 
 **The solution?** A fresh pair of eyes. A second LLM that isn't constrained by the first agent's token history can spot these coherence-driven mistakes that the original agent is blind to.
 
 ## What's wrong with existing AI code review solutions?
 
-At [Shelpuk AI Technology Consulting](https://shelpuk.com), we build custom AI products under a fixed-price model. Development efficiency isn't optional—it's how we stay profitable. We've been using AI coding assistants since 2023 (GitHub Copilot, Cursor, Windsurf, Claude Code, Codex), and we needed our agents' code reviewed by state-of-the-art open-source models via **OpenRouter**.
+At [Shelpuk AI Technology Consulting](https://shelpuk.com), we build custom AI products under a fixed-price model. Development efficiency isn't optional – it's how we stay profitable. We've been using AI coding assistants since 2023 (GitHub Copilot, Cursor, Windsurf, Claude Code, Codex), and we needed our agents' code reviewed by state-of-the-art open-source models via **OpenRouter**.
 
 Why OpenRouter? It's a unified gateway to both private and open-source models with Bring Your Own Key support. Essentially, **OpenRouter is all you need** :)
 
@@ -32,11 +32,11 @@ We tried the **PAL MCP server** for OpenRouter-based review, but it failed us fo
 
 ### Problem 1: Manual per-model configuration
 
-PAL requires package-level configuration for every OpenRouter model. Without it, PAL assumes a 32k context window and limits file input to ~6k tokens—clearly insufficient for code review tasks.
+PAL requires package-level configuration for every OpenRouter model. Without it, PAL assumes a 32k context window and limits file input to ~6k tokens – clearly insufficient for code review tasks.
 
 We even submitted PRs to add support for cutting-edge models like `moonshotai/kimi-k2-thinking` and `z-ai/glm-4.7` (current SOTA open-source models), but they've been sitting open for months. The PAL team seems overwhelmed, and the approach doesn't scale.
 
-### Problem 2: The bigger issue—lack of project context
+### Problem 2: The bigger issue – lack of project context
 
 This is the **real** problem with AI-reviewing-AI.
 
@@ -47,9 +47,9 @@ When a human engineer reviews a diff, they don't just check if the code "makes s
 - Design patterns used in other modules
 - Debug notes from similar past issues
 
-Most of the review value doesn't come from catching logical contradictions in the code itself—AI-generated code rarely has those. The value comes from spotting **gaps, inconsistencies, and contradictions with the larger system**.
+Most of the review value doesn't come from catching logical contradictions in the code itself – AI-generated code rarely has those. The value comes from spotting **gaps, inconsistencies, and contradictions with the larger system**.
 
-Most AI code reviewers are "amnesic"—they see the diff, but not the project's history, requirements, or architectural context. They're reviewing in a vacuum.
+Most AI code reviewers are "amnesic" – they see the diff, but not the project's history, requirements, or architectural context. They're reviewing in a vacuum.
 
 ## How Lad solves this
 
@@ -58,7 +58,7 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 ### Zero-config OpenRouter integration
 
 ✅ Lad fetches model metadata (context window size, tool calling support) directly from OpenRouter via the OpenRouter API.
-✅ If a model is available on OpenRouter, Lad can use it—**no manual configuration needed**.
+✅ If a model is available on OpenRouter, Lad can use it – **no manual configuration needed**.
 ✅ New models? They just work.
 
 ### Dual-reviewer mode by default
@@ -70,7 +70,7 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 
 ### Project-aware review (the killer feature)
 
-✅ Lad integrates with **Serena**—a "headless IDE" for AI coding agents
+✅ Lad integrates with **Serena** – a "headless IDE" for AI coding agents
 ✅ Serena provides token-efficient project indexing and persistent "memories"
 ✅ Your agents can record requirements, design decisions, debug findings, and more
 ✅ Memories survive across coding sessions and can be shared across teams
@@ -83,13 +83,13 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 - Reference design decisions from your project's memory bank
 - Review code in the context of your **entire project history**, not just the diff
 
-This is what human reviewers do—and now your AI reviewer can too.
+This is what human reviewers do – and now your AI reviewer can too.
 
 ### Workflow integration
 
 ✅ **`system_design_review`** for planning and architectural decisions
 ✅ **`code_review`** for implementation and diffs
-✅ Both tools support text input **and** file references via `paths`—no need to regenerate code for review
+✅ Both tools support text input **and** file references via `paths` – no need to regenerate code for review
 
 ### Works everywhere
 
@@ -97,11 +97,11 @@ Lad works with **Claude Code**, **Codex**, **Cursor**, **Antigravity**, **Windsu
 
 ### Battle-tested in production
 
-We've been using Lad daily for months in our production work. It's caught countless issues that would've slipped through—inconsistencies with requirements, architectural mismatches, and those subtle "bad token" effects that are invisible to the original coding agent.
+We've been using Lad daily for months in our production work. It's caught countless issues that would've slipped through – inconsistencies with requirements, architectural mismatches, and those subtle "bad token" effects that are invisible to the original coding agent.
 
-If you give it a try or like the idea, please drop us a star on GitHub—it's huge motivation for us to keep improving it! ⭐️
+If you give it a try or like the idea, please drop us a star on GitHub – it's huge motivation for us to keep improving it! ⭐️
 
-**P.S.** Check out our [Kindly Web Search MCP server](https://github.com/Shelpuk-AI-Technology-Consulting/kindly-web-search-mcp-server)—perhaps the only web search MCP for coding agents that actually works. It pairs perfectly with Lad for a complete research-and-review workflow.
+**P.S.** Check out our [Kindly Web Search MCP server](https://github.com/Shelpuk-AI-Technology-Consulting/kindly-web-search-mcp-server) – perhaps the only web search MCP for coding agents that actually works. It pairs perfectly with Lad for a complete research-and-review workflow.
 
 ## What Lad replaces
 
@@ -116,8 +116,8 @@ Lad eliminates the need for:
 
 Lad exposes two MCP tools:
 
-- **`system_design_review`** — Reviews architectural proposals, design documents, and planning decisions
-- **`code_review`** — Reviews implementation code, diffs, and file changes
+- **`system_design_review`**  –  Reviews architectural proposals, design documents, and planning decisions
+- **`code_review`**  –  Reviews implementation code, diffs, and file changes
 
 Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
 
@@ -162,7 +162,7 @@ Install Codex CLI:
 npm i -g @openai/codex
 ```
 
-CLI (no file editing) — add a local stdio MCP server (macOS / Linux):
+CLI (no file editing)  –  add a local stdio MCP server (macOS / Linux):
 
 ```bash
 codex mcp add lad \
@@ -198,7 +198,7 @@ startup_timeout_sec = 120.0
 
 ### Claude Code
 
-CLI (no file editing) — add a local stdio MCP server (macOS / Linux):
+CLI (no file editing)  –  add a local stdio MCP server (macOS / Linux):
 
 ```bash
 claude mcp add --transport stdio \
