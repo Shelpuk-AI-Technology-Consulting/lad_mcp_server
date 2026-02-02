@@ -441,7 +441,7 @@ Both tools accept either direct text (`proposal` / `code`) or `paths` (files/dir
 During directory expansion, hidden files and directories (dotfiles) are skipped; pass an explicit path (e.g., `.gitignore`) if you want it included.
 
 Example tool payloads:
-- `system_design_review`: `{"paths":["research/AI Code Review MCP Server Design.md"],"constraints":"..."}`
+- `system_design_review`: `{"paths":["src/retrieval.py"],"constraints":"..."}`
 - `code_review`: `{"paths":["lad_mcp_server","tests"],"context":"Please prioritize correctness and failure modes in auth/session logic."}`
 
 Notes:
