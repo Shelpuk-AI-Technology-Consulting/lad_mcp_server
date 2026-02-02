@@ -1,23 +1,74 @@
 # Lad MCP Server
 
-An MCP (Model Context Protocol) server that exposes two tools:
+**We open-sourced Lad — the Code Review & System Design MCP server we built internally to quality-check our coding agents.**
+
+Lad is an MCP (Model Context Protocol) server that exposes two tools:
 
 - `system_design_review`
 - `code_review`
 
 Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
 
-If the target repository contains `.serena/` and the selected models support tool calling, Lad exposes a **read-only Serena tool bridge** to both reviewers (with mandatory `activate_project(".")` preflight).
+## Why build another AI reviewer?
 
-## Quickstart
+Because **Agent Tunnel Vision** is real.
 
-### 1) Requirements
+LLMs generate token by token. Once an agent makes a bad design choice early in the code, every subsequent token tries to justify that mistake to maintain cohesion. The agent effectively gaslights itself.
+
+To catch this, you need a second pair of eyes — a fresh context.
+
+## What was wrong with existing solutions?
+
+We wanted to review our agents’ code using state-of-the-art models via OpenRouter (one place to access both private and open-source models, with BYOK support).
+
+(Disclaimer: We are not affiliated with OpenRouter in any way.)
+
+We tried PAL MCP server for OpenRouter-based review, but it failed us:
+
+- **Manual per-model configuration** (package-level), which doesn’t scale as new models appear.
+- **Outdated context-window assumptions** that effectively limit file input to a small fraction of what modern review tasks need.
+
+### The bigger problem: lack of context
+
+The biggest problem with AI reviewing AI is **context**.
+
+A human reviewer doesn’t just check if the diff “makes sense in isolation”. They check it against requirements, team constraints, and prior architectural decisions. Most AI reviewers are “amnesic” — they see the diff, not the project’s history.
+
+## Lad solves this with project memory + review logic
+
+**Features**
+
+✅ **Zero-config OpenRouter model metadata**: Lad automatically fetches model info from OpenRouter (context window + tool calling support). If a model is available on OpenRouter, Lad can use it without manual configuration.
+
+✅ **Dual-reviewer mode**: by default, it runs a consensus check using two different strong models to reduce individual model bias. (You can disable Secondary via `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`.)
+
+✅ **Context-aware (the killer feature)**: Lad integrates with **Serena** (a “headless IDE” / memory tool for coding agents). This allows reviewers to access the project index and “memories” (requirements, design docs, debug notes).
+
+*(Disclaimer: We are not affiliated with Serena in any way.)*
+
+**Result:** reviewers don’t just spot bugs — they spot inconsistencies with system modules, mismatches with requirements, or contradictions with design decisions settled weeks ago.
+
+✅ **Workflow integration**:
+- `system_design_review` for planning / design decisions
+- `code_review` for implementation / diffs
+
+✅ **Text or file references**: Lad supports both text inputs and file references via `paths`, so your agent doesn’t need to regenerate the code or design doc for review — referencing files is enough.
+
+Lad works with Claude Code, Codex, Cursor, Antigravity, and any other MCP client that supports stdio MCP servers. It can also be run locally via Docker (see below).
+
+P.S. If you give it a try or like the idea, please drop us a star on GitHub — it’s huge motivation for us to keep improving it.
+
+P.P.S. You can also check out our Kindly Web Search MCP server — it pairs well with Lad for a full research-and-review workflow.
+
+## Requirements
 
 - Python 3.11+
 - `uv` (recommended) or `pip`
 - `OPENROUTER_API_KEY` (required)
 
-### 2) Run command used by MCP clients (stdio)
+## Quickstart
+
+Run command used by MCP clients (stdio):
 
 ```bash
 uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server \
