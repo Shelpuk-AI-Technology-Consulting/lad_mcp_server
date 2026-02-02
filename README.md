@@ -1,64 +1,126 @@
 # Lad MCP Server
 
-**We open-sourced Lad — the Code Review & System Design MCP server we built internally to quality-check our coding agents.**
+**Project-aware AI code review for AI coding agents.**
 
-Lad is an MCP (Model Context Protocol) server that exposes two tools:
+![Lad MCP Server](assets/lad_header.png)
 
-- `system_design_review`
-- `code_review`
+## Why review AI-generated code with another AI?
 
-Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
+Picture this: Your coding agent just spent 20 minutes refactoring your authentication module. The code looks clean, passes tests, and the agent is confident. You merge it. Three days later, you discover it breaks the SSO integration that was documented in a design decision from two months ago—a decision the agent never saw.
 
-## Why build another AI reviewer?
+This isn't a bug in the code. It's a bug in the **context**.
 
-Because **Agent Tunnel Vision** is real.
+### The "Bad Token" Problem
 
-LLMs generate token by token. Once an agent makes a bad design choice early in the code, every subsequent token tries to justify that mistake to maintain cohesion. The agent effectively gaslights itself.
+LLMs generate text token by token. Each new token is chosen to maximize coherence with all previous tokens. So when an agent makes a questionable design choice early on, every subsequent token tries to justify and reinforce that mistake to maintain cohesion. The agent effectively **gaslights itself**.
 
-To catch this, you need a second pair of eyes — a fresh context.
+Think of it like this: if you start a sentence with a wrong assumption, your brain automatically tries to make the rest of the sentence sound convincing—even if the premise is flawed. LLMs do the same thing, but they can't step back and question their earlier choices.
 
-## What was wrong with existing solutions?
+When generating large code segments, "if" the agent makes a bad choice becomes "**when**"—it's statistically inevitable.
 
-We wanted to review our agents’ code using state-of-the-art models via OpenRouter (one place to access both private and open-source models, with BYOK support).
+**The solution?** A fresh pair of eyes. A second LLM that isn't constrained by the first agent's token history can spot these coherence-driven mistakes that the original agent is blind to.
 
-(Disclaimer: We are not affiliated with OpenRouter in any way.)
+## What's wrong with existing AI code review solutions?
 
-We tried PAL MCP server for OpenRouter-based review, but it failed us:
+At [Shelpuk AI Technology Consulting](https://shelpuk.com), we build custom AI products under a fixed-price model. Development efficiency isn't optional—it's how we stay profitable. We've been using AI coding assistants since 2023 (GitHub Copilot, Cursor, Windsurf, Claude Code, Codex), and we needed our agents' code reviewed by state-of-the-art open-source models via **OpenRouter**.
 
-- **Manual per-model configuration** (package-level), which doesn’t scale as new models appear.
-- **Outdated context-window assumptions** that effectively limit file input to a small fraction of what modern review tasks need.
+Why OpenRouter? It's a unified gateway to both private and open-source models with Bring Your Own Key support. Essentially, **OpenRouter is all you need** :)
 
-### The bigger problem: lack of context
+*(Disclaimer: We are not affiliated with OpenRouter in any way.)*
 
-The biggest problem with AI reviewing AI is **context**.
+We tried the **PAL MCP server** for OpenRouter-based review, but it failed us for two reasons:
 
-A human reviewer doesn’t just check if the diff “makes sense in isolation”. They check it against requirements, team constraints, and prior architectural decisions. Most AI reviewers are “amnesic” — they see the diff, not the project’s history.
+### Problem 1: Manual per-model configuration
 
-## Lad solves this with project memory + review logic
+PAL requires package-level configuration for every OpenRouter model. Without it, PAL assumes a 32k context window and limits file input to ~6k tokens—clearly insufficient for code review tasks.
 
-**Features**
+We even submitted PRs to add support for cutting-edge models like `moonshotai/kimi-k2-thinking` and `z-ai/glm-4.7` (current SOTA open-source models), but they've been sitting open for months. The PAL team seems overwhelmed, and the approach doesn't scale.
 
-✅ **Zero-config OpenRouter model metadata**: Lad automatically fetches model info from OpenRouter (context window + tool calling support). If a model is available on OpenRouter, Lad can use it without manual configuration.
+### Problem 2: The bigger issue—lack of project context
 
-✅ **Dual-reviewer mode**: by default, it runs a consensus check using two different strong models to reduce individual model bias. (You can disable Secondary via `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`.)
+This is the **real** problem with AI-reviewing-AI.
 
-✅ **Context-aware (the killer feature)**: Lad integrates with **Serena** (a “headless IDE” / memory tool for coding agents). This allows reviewers to access the project index and “memories” (requirements, design docs, debug notes).
+When a human engineer reviews a diff, they don't just check if the code "makes sense in isolation." They evaluate it against:
+- Requirements from the spec
+- Team constraints and conventions
+- Prior architectural decisions
+- Design patterns used in other modules
+- Debug notes from similar past issues
+
+Most of the review value doesn't come from catching logical contradictions in the code itself—AI-generated code rarely has those. The value comes from spotting **gaps, inconsistencies, and contradictions with the larger system**.
+
+Most AI code reviewers are "amnesic"—they see the diff, but not the project's history, requirements, or architectural context. They're reviewing in a vacuum.
+
+## How Lad solves this
+
+We built **Lad** for our internal use and decided to open-source it. Here's what makes it different:
+
+### Zero-config OpenRouter integration
+
+✅ Lad fetches model metadata (context window size, tool calling support) directly from OpenRouter via the OpenRouter API.
+✅ If a model is available on OpenRouter, Lad can use it—**no manual configuration needed**.
+✅ New models? They just work.
+
+### Dual-reviewer mode by default
+
+✅ Lad runs **two reviewers in parallel** (default: `moonshotai/kimi-k2-thinking` and `z-ai/glm-4.7`)
+✅ Reduces individual model bias and catches more issues
+✅ Returns both reviews plus a synthesized summary
+✅ You can switch to single-reviewer mode with `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`
+
+### Project-aware review (the killer feature)
+
+✅ Lad integrates with **Serena**—a "headless IDE" for AI coding agents
+✅ Serena provides token-efficient project indexing and persistent "memories"
+✅ Your agents can record requirements, design decisions, debug findings, and more
+✅ Memories survive across coding sessions and can be shared across teams
 
 *(Disclaimer: We are not affiliated with Serena in any way.)*
 
-**Result:** reviewers don’t just spot bugs — they spot inconsistencies with system modules, mismatches with requirements, or contradictions with design decisions settled weeks ago.
+**Here's the magic:** Lad connects your Serena repository index and memories to the reviewer LLMs. Now the reviewing agent can:
+- Spot inconsistencies with other system modules
+- Catch mismatches with requirements settled months ago
+- Reference design decisions from your project's memory bank
+- Review code in the context of your **entire project history**, not just the diff
 
-✅ **Workflow integration**:
-- `system_design_review` for planning / design decisions
-- `code_review` for implementation / diffs
+This is what human reviewers do—and now your AI reviewer can too.
 
-✅ **Text or file references**: Lad supports both text inputs and file references via `paths`, so your agent doesn’t need to regenerate the code or design doc for review — referencing files is enough.
+### Workflow integration
 
-Lad works with Claude Code, Codex, Cursor, Antigravity, and any other MCP client that supports stdio MCP servers. It can also be run locally via Docker (see below).
+✅ **`system_design_review`** for planning and architectural decisions
+✅ **`code_review`** for implementation and diffs
+✅ Both tools support text input **and** file references via `paths`—no need to regenerate code for review
 
-P.S. If you give it a try or like the idea, please drop us a star on GitHub — it’s huge motivation for us to keep improving it.
+### Works everywhere
 
-P.P.S. You can also check out our Kindly Web Search MCP server — it pairs well with Lad for a full research-and-review workflow.
+Lad works with **Claude Code**, **Codex**, **Cursor**, **Antigravity**, **Windsurf**, and any other MCP client that supports stdio servers. It can also run as a standalone Docker-based tool.
+
+### Battle-tested in production
+
+We've been using Lad daily for months in our production work. It's caught countless issues that would've slipped through—inconsistencies with requirements, architectural mismatches, and those subtle "bad token" effects that are invisible to the original coding agent.
+
+If you give it a try or like the idea, please drop us a star on GitHub—it's huge motivation for us to keep improving it! ⭐️
+
+**P.S.** Check out our [Kindly Web Search MCP server](https://github.com/Shelpuk-AI-Technology-Consulting/kindly-web-search-mcp-server)—perhaps the only web search MCP for coding agents that actually works. It pairs perfectly with Lad for a complete research-and-review workflow.
+
+## What Lad replaces
+
+Lad eliminates the need for:
+
+✅ Manual OpenRouter model configuration
+✅ Context-blind AI code reviewers
+✅ Separate tools for design review vs. code review
+✅ Constantly re-explaining requirements to reviewers
+
+## Tools
+
+Lad exposes two MCP tools:
+
+- **`system_design_review`** — Reviews architectural proposals, design documents, and planning decisions
+- **`code_review`** — Reviews implementation code, diffs, and file changes
+
+Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
+
 
 ## Requirements
 
