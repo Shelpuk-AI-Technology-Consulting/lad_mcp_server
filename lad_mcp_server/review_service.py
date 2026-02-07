@@ -32,6 +32,7 @@ from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
 log = logging.getLogger(__name__)
 
 CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for mixed tokenizers
+OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS = 5  # avoid racing external tool-call deadlines
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
@@ -583,10 +584,15 @@ class ReviewService:
                     else:
                         tool_choice = "auto"
 
+            call_timeout_seconds = max(
+                int(reviewer_timeout_seconds) - int(OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS),
+                1,
+            )
+
             result = await self._openrouter.chat_completion(
                 model=model,
                 messages=messages,
-                timeout_seconds=reviewer_timeout_seconds,
+                timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
                 tools=tools,
                 tool_choice=tool_choice,
