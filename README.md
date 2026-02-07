@@ -410,17 +410,19 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 
 ### Budgeting / limits
 
-- `OPENROUTER_FIXED_OUTPUT_TOKENS` (default: `16384`)
+- `OPENROUTER_FIXED_OUTPUT_TOKENS` (default: `8192`)
 - `OPENROUTER_CONTEXT_OVERHEAD_TOKENS` (default: `2000`)
 - `OPENROUTER_MODEL_METADATA_TTL_SECONDS` (default: `3600`)
 - `OPENROUTER_MAX_INPUT_CHARS` (default: `100000`)
 - `OPENROUTER_INCLUDE_REASONING` (default: `false`)
 
+Note: if your reviewer output is frequently cut off, increase `OPENROUTER_FIXED_OUTPUT_TOKENS` (this reduces room for file context in the prompt).
+
 ### Serena bridge (optional – only when `.serena/` exists and tool calling is supported)
 
 **Note:** These variables are only used when Serena integration is active. You don't need to set them if you're not using Serena.
 
-- `LAD_SERENA_MAX_TOOL_CALLS` (default: `8`)
+- `LAD_SERENA_MAX_TOOL_CALLS` (default: `32`)
 - `LAD_SERENA_TOOL_TIMEOUT_SECONDS` (default: `30`)
 - `LAD_SERENA_MAX_TOOL_RESULT_CHARS` (default: `12000`)
 - `LAD_SERENA_MAX_TOTAL_CHARS` (default: `50000`)

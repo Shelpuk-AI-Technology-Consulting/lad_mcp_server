@@ -113,7 +113,7 @@ class Settings:
         if tool_call_timeout <= 0:
             raise ValueError("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > 0")
 
-        fixed_output_tokens = _get_int("OPENROUTER_FIXED_OUTPUT_TOKENS", 16384)
+        fixed_output_tokens = _get_int("OPENROUTER_FIXED_OUTPUT_TOKENS", 8192)
         if fixed_output_tokens <= 0:
             raise ValueError("OPENROUTER_FIXED_OUTPUT_TOKENS must be > 0")
 
@@ -145,7 +145,7 @@ class Settings:
             openrouter_model_metadata_ttl_seconds=_get_int("OPENROUTER_MODEL_METADATA_TTL_SECONDS", 3600),
             openrouter_max_input_chars=max_input_chars,
             openrouter_include_reasoning=_get_bool("OPENROUTER_INCLUDE_REASONING", False),
-            lad_serena_max_tool_calls=_get_int("LAD_SERENA_MAX_TOOL_CALLS", 8),
+            lad_serena_max_tool_calls=_get_int("LAD_SERENA_MAX_TOOL_CALLS", 32),
             lad_serena_tool_timeout_seconds=_get_int("LAD_SERENA_TOOL_TIMEOUT_SECONDS", 30),
             lad_serena_max_tool_result_chars=_get_int("LAD_SERENA_MAX_TOOL_RESULT_CHARS", 12000),
             lad_serena_max_total_chars=_get_int("LAD_SERENA_MAX_TOTAL_CHARS", 50000),
