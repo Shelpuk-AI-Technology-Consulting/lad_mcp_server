@@ -46,7 +46,10 @@ def create_app() -> Any:
         except ValidationError as exc:
             return format_validation_error(str(exc))
         except Exception as exc:  # pragma: no cover
-            return format_fatal_error(str(exc))
+            msg = str(exc).strip()
+            if not msg:
+                msg = exc.__class__.__name__
+            return format_fatal_error(msg)
 
     @mcp.tool()
     async def code_review(
@@ -66,6 +69,9 @@ def create_app() -> Any:
         except ValidationError as exc:
             return format_validation_error(str(exc))
         except Exception as exc:  # pragma: no cover
-            return format_fatal_error(str(exc))
+            msg = str(exc).strip()
+            if not msg:
+                msg = exc.__class__.__name__
+            return format_fatal_error(msg)
 
     return mcp

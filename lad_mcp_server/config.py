@@ -105,13 +105,20 @@ class Settings:
         if max_concurrency <= 0:
             raise ValueError("OPENROUTER_MAX_CONCURRENT_REQUESTS must be > 0")
 
-        reviewer_timeout = _get_int("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", 180)
+        reviewer_timeout = _get_int("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", 300)
         if reviewer_timeout <= 0:
             raise ValueError("OPENROUTER_REVIEWER_TIMEOUT_SECONDS must be > 0")
 
-        tool_call_timeout = _get_int("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS", 240)
+        # Tool call timeout must not undercut per-reviewer timeout; otherwise the entire request gets cancelled
+        # before any reviewer can finish, producing a misleading generic error.
+        tool_call_timeout_default = reviewer_timeout + 60
+        tool_call_timeout = _get_int("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS", tool_call_timeout_default)
         if tool_call_timeout <= 0:
             raise ValueError("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > 0")
+        if tool_call_timeout < reviewer_timeout:
+            raise ValueError(
+                "OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be >= OPENROUTER_REVIEWER_TIMEOUT_SECONDS"
+            )
 
         fixed_output_tokens = _get_int("OPENROUTER_FIXED_OUTPUT_TOKENS", 8192)
         if fixed_output_tokens <= 0:

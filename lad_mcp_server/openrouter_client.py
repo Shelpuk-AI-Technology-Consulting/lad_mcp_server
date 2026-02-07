@@ -67,13 +67,32 @@ class OpenRouterClient:
             self._default_headers["HTTP-Referer"] = http_referer
         if x_title:
             self._default_headers["X-Title"] = x_title
-        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+        # NOTE: asyncio synchronization primitives can be event-loop bound (notably in newer Python versions).
+        # This client is typically constructed outside of an active event loop (e.g., at FastMCP app startup),
+        # so we must initialize loop-bound primitives lazily when `chat_completion()` runs.
+        self._max_concurrent_requests = max_concurrent_requests
+        self._semaphore: asyncio.Semaphore | None = None
+        self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._semaphore_init_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_concurrent_requests)
         self._closed = False
         atexit.register(self.close)
 
         self._client = None
         self._client_lock = threading.Lock()
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        sem = self._semaphore
+        if sem is not None and self._semaphore_loop is loop:
+            return sem
+        with self._semaphore_init_lock:
+            sem = self._semaphore
+            if sem is not None and self._semaphore_loop is loop:
+                return sem
+            self._semaphore = asyncio.Semaphore(self._max_concurrent_requests)
+            self._semaphore_loop = loop
+            return self._semaphore
 
     def close(self) -> None:
         """
@@ -195,7 +214,7 @@ class OpenRouterClient:
         """
         client = self._get_client()
 
-        async with self._semaphore:
+        async with self._get_semaphore():
             if client == "stdlib":
                 return await self._chat_completion_stdlib(
                     model=model,

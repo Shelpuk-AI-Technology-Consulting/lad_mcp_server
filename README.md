@@ -403,8 +403,8 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 ### OpenRouter request behavior
 
 - `OPENROUTER_MAX_CONCURRENT_REQUESTS` (default: `4`)
-- `OPENROUTER_REVIEWER_TIMEOUT_SECONDS` (default: `180`, per reviewer)
-- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `240`, per tool call)
+- `OPENROUTER_REVIEWER_TIMEOUT_SECONDS` (default: `300`, wall-clock per reviewer run)
+- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `360`, per tool call; must be >= reviewer timeout)
 - `OPENROUTER_HTTP_REFERER` (optional; forwarded to OpenRouter)
 - `OPENROUTER_X_TITLE` (optional; forwarded to OpenRouter)
 

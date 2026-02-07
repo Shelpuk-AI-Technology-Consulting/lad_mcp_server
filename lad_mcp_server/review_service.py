@@ -43,6 +43,11 @@ def _truncate_to_chars(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:max_chars], True
 
 
+def _exc_message(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    return msg if msg else exc.__class__.__name__
+
+
 def _build_tool_message(tool_call_id: str, name: str, content: str) -> dict[str, Any]:
     return {"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content}
 
@@ -184,7 +189,12 @@ class ReviewService:
                 requested_paths=req.paths,
             )
 
-        return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
+        try:
+            return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Tool call timed out after {self._settings.openrouter_tool_call_timeout_seconds}s"
+            ) from exc
 
     async def code_review(self, **kwargs: Any) -> str:
         req = CodeReviewRequest.validate(
@@ -206,7 +216,12 @@ class ReviewService:
                 requested_paths=req.paths,
             )
 
-        return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
+        try:
+            return await asyncio.wait_for(_run(), timeout=self._settings.openrouter_tool_call_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Tool call timed out after {self._settings.openrouter_tool_call_timeout_seconds}s"
+            ) from exc
 
     async def _run_dual_review(
         self,
@@ -473,18 +488,20 @@ class ReviewService:
         extra_body_to_send = extra_body or None
 
         try:
-            markdown = await self._tool_loop(
-                model=model,
-                messages=messages,
-                tools=tools,
-                tool_choice_supported=cfg.tool_choice_supported,
-                serena_ctx=serena_ctx,
-                extra_body=extra_body_to_send,
-                reviewer_timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
-                max_output_tokens=budget.effective_output_budget,
-                max_tool_calls=self._settings.lad_serena_max_tool_calls,
-                tool_timeout_seconds=self._settings.lad_serena_tool_timeout_seconds,
-            )
+            # Enforce a wall-clock cap for the whole reviewer run (including multiple OpenRouter calls and tool calls).
+            async with asyncio.timeout(self._settings.openrouter_reviewer_timeout_seconds):
+                markdown = await self._tool_loop(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice_supported=cfg.tool_choice_supported,
+                    serena_ctx=serena_ctx,
+                    extra_body=extra_body_to_send,
+                    reviewer_timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                    max_output_tokens=budget.effective_output_budget,
+                    max_tool_calls=self._settings.lad_serena_max_tool_calls,
+                    tool_timeout_seconds=self._settings.lad_serena_tool_timeout_seconds,
+                )
             used_serena = serena_ctx is not None and (
                 serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths
             )
@@ -500,7 +517,24 @@ class ReviewService:
                 markdown=markdown,
                 error=None,
             )
+        except TimeoutError as exc:
+            # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
+            msg = f"Reviewer timed out after {self._settings.openrouter_reviewer_timeout_seconds}s"
+            used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
+            return ReviewerOutcome(
+                ok=False,
+                model=model,
+                used_serena=used_serena,
+                serena_disabled_reason=serena_disabled_reason,
+                serena_activated_project=serena_ctx.activated_project if serena_ctx is not None else None,
+                serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
+                serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
+                serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
+                markdown=_format_reviewer_error(model, msg),
+                error=msg,
+            )
         except Exception as exc:
+            msg = _exc_message(exc)
             return ReviewerOutcome(
                 ok=False,
                 model=model,
@@ -510,8 +544,8 @@ class ReviewService:
                 serena_used_tools=(),
                 serena_used_memories=(),
                 serena_used_paths=(),
-                markdown=_format_reviewer_error(model, str(exc)),
-                error=str(exc),
+                markdown=_format_reviewer_error(model, msg),
+                error=msg,
             )
 
     async def _tool_loop(
@@ -588,14 +622,19 @@ class ReviewService:
                     except SerenaToolError as exc:
                         return json.dumps({"error": str(exc)})
 
-                loop = asyncio.get_running_loop()
-                try:
-                    tool_out = await asyncio.wait_for(
-                        loop.run_in_executor(self._tool_executor, _run_tool_sync),
-                        timeout=tool_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    tool_out = json.dumps({"error": f"tool call timed out after {tool_timeout_seconds}s"})
+                # Preflight tools are intentionally lightweight and safe to run inline; keeping them out of the
+                # threadpool avoids startup/scheduling delays that can cause false timeouts in short-review tests.
+                if fn_name in {"activate_project", "read_project_overview"}:
+                    tool_out = _run_tool_sync()
+                else:
+                    loop = asyncio.get_running_loop()
+                    try:
+                        tool_out = await asyncio.wait_for(
+                            loop.run_in_executor(self._tool_executor, _run_tool_sync),
+                            timeout=tool_timeout_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        tool_out = json.dumps({"error": f"tool call timed out after {tool_timeout_seconds}s"})
 
                 messages.append(_build_tool_message(tc_id, fn_name, tool_out))
 

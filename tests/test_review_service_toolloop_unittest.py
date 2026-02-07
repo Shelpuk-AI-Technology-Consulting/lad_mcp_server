@@ -18,14 +18,22 @@ class _ModelsStub:
 
 class _OpenRouterClientStub:
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop = None
         self._calls: dict[str, int] = {}
+
+    def _get_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     async def chat_completion(self, *, model, messages, timeout_seconds, max_output_tokens, tools=None, tool_choice=None, extra_body=None):
         # Minimal tool-loop simulator:
         # - honor forced tool_choice preflight (activate_project, read_project_overview)
         # - then return a final content response.
-        async with self._lock:
+        async with self._get_lock():
             idx = self._calls.get(model, 0)
             self._calls[model] = idx + 1
 
