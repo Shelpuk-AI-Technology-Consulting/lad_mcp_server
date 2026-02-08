@@ -502,6 +502,89 @@ Use Docker from an MCP client (example config fragment):
 
 Note: stdio servers are **local-process** servers. If your client config uses `command`/`args`, it must be able to execute that command (locally), even if the command is `docker`.
 
+## How to Speed Up LAD MCP Server
+
+If you face timeouts or design / code review takes too long, you can improve the performance as follows.
+
+### MCP Server Timeout Configuration
+
+Both reviewers usually complete in under a minute, but for larger review tasks (especially with multiple Serena tool calls), set the **MCP tool execution timeout** to 5 minutes where your client supports it.
+
+Important: the 5-minute recommendation is for **tool execution/request timeout**, not MCP server startup timeout.
+
+As of February 8, 2026, timeout configuration differs by client:
+
+**Codex** (supports both startup timeout and tool execution timeout in `config.toml`):
+```toml
+[mcp_servers.lad]
+command = "uvx"
+args = ["--from", "git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server", "lad-mcp-server"]
+startup_timeout_sec = 60.0
+tool_timeout_sec = 300.0
+```
+Docs: https://developers.openai.com/codex/mcp/
+
+**Claude Code** (does not currently document a separate MCP tool execution timeout setting):
+- `MCP_TIMEOUT` is documented as **startup timeout** (milliseconds), not tool execution timeout.
+```bash
+export MCP_TIMEOUT=120000
+claude
+```
+Docs: https://code.claude.com/docs/en/mcp
+
+**Cursor** (MCP config is documented, but no timeout key is documented in `mcp.json` fields):
+- Documented fields include `command` / `args` / `env` / `envFile` (stdio), and `url` / `headers` / `auth` (remote).
+- Workaround: prewarm once in a terminal, then restart Cursor:
+```bash
+uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server
+```
+Docs: https://cursor.com/docs/context/mcp
+
+**Gemini CLI** (supports per-server MCP request timeout in milliseconds via `timeout`):
+```json
+{
+  "mcpServers": {
+    "lad": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server",
+        "lad-mcp-server"
+      ],
+      "timeout": 300000,
+      "trust": false
+    }
+  }
+}
+```
+You can also set it from CLI when adding a server:
+```bash
+gemini mcp add --timeout 300000 lad uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server lad-mcp-server
+```
+Docs: https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md
+
+**Windsurf** (MCP config is documented, but no timeout key is documented in `mcp_config.json`):
+- Use the same prewarm workaround if first run is slow.
+Docs: https://docs.windsurf.com/windsurf/cascade/mcp
+
+**Antigravity** (MCP integration is documented, but no timeout key is documented for custom `mcp_config.json` setup):
+- Use the same prewarm workaround if first run is slow.
+Docs: https://antigravity.google/docs/mcp
+
+### Optimizing OpenRouter Configuration
+
+Check OpenRouter Activity to see the throughput for your LLM calls:
+
+![OpenRouter Activity](assets/openrouter_activity.png)
+
+If you see your LLM calls have low throughput (less than 30 tokens/second), consider restricting the low-throughput provider. For example, as of February 8, 2026, DeepInfra has very low throughput for both `moonshotai/kimi-k2.5` and `z-ai/glm-4.7`, so we restrict OpenRouter from routing our LLM calls there:
+
+![OpenRouter Provider Restrictions](assets/openrouter_provider_restrictions.png)
+
+We also recommend that you prioritize OpenRouter providers by throughput:
+
+![OpenRouter Default Provider](assets/openrouter_default_provider.png)
+
 ## Troubleshooting
 
 - First run is slow / client times out: run the `uvx` command from Quickstart once in a terminal to prewarm, then restart the client.
