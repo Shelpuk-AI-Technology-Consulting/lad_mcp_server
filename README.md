@@ -502,7 +502,7 @@ Use Docker from an MCP client (example config fragment):
 
 Note: stdio servers are **local-process** servers. If your client config uses `command`/`args`, it must be able to execute that command (locally), even if the command is `docker`.
 
-## How to Speed Up LAD MCP Server
+## How to Speed Up Lad MCP Server
 
 If you face timeouts or design / code review takes too long, you can improve the performance as follows.
 
