@@ -218,9 +218,8 @@ startup_timeout_sec = 120.0
 CLI (no file editing)  –  add a local stdio MCP server (macOS / Linux):
 
 ```bash
-claude mcp add --transport stdio \
-  --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
-  lad \
+claude mcp add --transport stdio lad \
+  -e OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
   -- uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server \
   lad-mcp-server
 ```
@@ -228,9 +227,8 @@ claude mcp add --transport stdio \
 Windows (PowerShell):
 
 ```powershell
-claude mcp add --transport stdio `
-  --env OPENROUTER_API_KEY="$env:OPENROUTER_API_KEY" `
-  lad `
+claude mcp add --transport stdio lad `
+  -e OPENROUTER_API_KEY="$env:OPENROUTER_API_KEY" `
   -- uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server `
   lad-mcp-server
 ```
