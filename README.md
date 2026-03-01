@@ -1,4 +1,4 @@
-# Lad MCP Server
+# Improve AI-generated code quality by 20%
 
 **Project-aware AI code review for AI coding agents.**
 
@@ -15,7 +15,7 @@ Works with **Claude Code**, **Codex**, **Antigravity**, **Cursor**, **Windsurf**
 
 If you like what we're building, please ⭐ **star this repo** – it's a huge motivation for us to keep going!
 
-## Lad
+# Lad MCP PServer
 
 ![Lad MCP Server](assets/lad_header.png)
 
