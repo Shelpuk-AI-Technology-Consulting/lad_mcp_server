@@ -64,7 +64,7 @@ def main() -> int:
         return 3
 
     out = asyncio.run(_run())
-    secondary_expected = os.getenv("OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-4.7").strip() != "0"
+    secondary_expected = os.getenv("OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-5").strip() != "0"
 
     def section(start_marker: str, end_markers: list[str]) -> str:
         # Use substring slicing (not strict ^...$ regex) to be resilient to

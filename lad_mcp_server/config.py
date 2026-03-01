@@ -135,13 +135,13 @@ class Settings:
         return Settings(
             openrouter_api_key=api_key,
             openrouter_primary_reviewer_model=_get_str(
-                "OPENROUTER_PRIMARY_REVIEWER_MODEL", "moonshotai/kimi-k2-thinking"
+                "OPENROUTER_PRIMARY_REVIEWER_MODEL", "moonshotai/kimi-k2.5"
             )
-            or "moonshotai/kimi-k2-thinking",
+            or "moonshotai/kimi-k2.5",
             openrouter_secondary_reviewer_model=_get_str(
-                "OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-4.7"
+                "OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-5"
             )
-            or "z-ai/glm-4.7",
+            or "z-ai/glm-5",
             openrouter_http_referer=_get_str("OPENROUTER_HTTP_REFERER"),
             openrouter_x_title=_get_str("OPENROUTER_X_TITLE"),
             openrouter_reviewer_timeout_seconds=reviewer_timeout,

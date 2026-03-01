@@ -65,7 +65,7 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 
 ### Dual-reviewer mode by default
 
-✅ Lad runs **two reviewers in parallel** (default: `moonshotai/kimi-k2-thinking` and `z-ai/glm-4.7`)
+✅ Lad runs **two reviewers in parallel** (default: `moonshotai/kimi-k2.5` and `z-ai/glm-5`)
 
 ✅ Reduces individual model bias and catches more issues
 
@@ -394,8 +394,8 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 
 ### OpenRouter models
 
-- `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2-thinking`)
-- `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `z-ai/glm-4.7`)
+- `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2.5`)
+- `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `z-ai/glm-5`)
   - Set to `0` to disable the Secondary reviewer (Primary-only mode).
 
 ### OpenRouter request behavior
