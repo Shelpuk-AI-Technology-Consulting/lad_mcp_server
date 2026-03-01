@@ -15,6 +15,7 @@ Works with **Claude Code**, **Codex**, **Antigravity**, **Cursor**, **Windsurf**
 
 If you like what we're building, please ⭐ **star this repo** – it's a huge motivation for us to keep going!
 
+## Lad
 
 ![Lad MCP Server](assets/lad_header.png)
 
