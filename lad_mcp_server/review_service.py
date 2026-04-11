@@ -900,6 +900,8 @@ class ReviewService:
         degraded_outputs_count = 0
         consecutive_degraded_outputs = 0
         consecutive_guard_triggered = False
+        had_tool_interaction = False
+        empty_post_tool_retry_used = False
 
         while True:
             tool_choice: str | dict[str, Any] | None = "auto" if tools else None
@@ -949,8 +951,23 @@ class ReviewService:
             )
 
             if not result.tool_calls:
+                content = result.content or ""
+                if (
+                    content.strip() == ""
+                    and had_tool_interaction
+                    and not empty_post_tool_retry_used
+                ):
+                    empty_post_tool_retry_used = True
+                    tools = None
+                    messages.append(
+                        _build_system_message(
+                            "Previous model turn returned an empty response after tool interaction. "
+                            "Provide a non-empty final review now."
+                        )
+                    )
+                    continue
                 return _append_tooling_degradation_summary(
-                    result.content or "",
+                    content,
                     degraded_outputs_count=degraded_outputs_count,
                     consecutive_guard_triggered=consecutive_guard_triggered,
                 )
@@ -1003,6 +1020,7 @@ class ReviewService:
                         tool_out = json.dumps({"error": f"tool call timed out after {tool_timeout_seconds}s"})
 
                 messages.append(_build_tool_message(tc_id, fn_name, tool_out))
+                had_tool_interaction = True
 
                 if fn_name == "read_project_overview":
                     covered_required_memories.add("project_overview.md")
