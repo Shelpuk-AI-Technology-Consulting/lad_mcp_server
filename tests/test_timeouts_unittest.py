@@ -63,6 +63,20 @@ class TestSettingsTimeoutDefaults(unittest.TestCase):
         self.assertEqual(s.openrouter_primary_reviewer_model, "moonshotai/kimi-k2.5")
         self.assertEqual(s.openrouter_secondary_reviewer_model, "minimax/minimax-m2.7")
 
+    def test_zai_coding_plan_key_is_optional(self) -> None:
+        os.environ["OPENROUTER_API_KEY"] = "test"
+        os.environ.pop("ZAI_CODING_PLAN_KEY", None)
+
+        s = Settings.from_env()
+        self.assertIsNone(s.zai_coding_plan_key)
+
+    def test_zai_coding_plan_key_is_loaded_when_set(self) -> None:
+        os.environ["OPENROUTER_API_KEY"] = "test"
+        os.environ["ZAI_CODING_PLAN_KEY"] = "zai-test-key"
+
+        s = Settings.from_env()
+        self.assertEqual(s.zai_coding_plan_key, "zai-test-key")
+
 
 class TestTimeoutMessages(unittest.TestCase):
     def test_reviewer_timeout_is_actionable(self) -> None:

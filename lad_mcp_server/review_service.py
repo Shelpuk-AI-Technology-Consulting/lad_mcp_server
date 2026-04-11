@@ -29,6 +29,7 @@ from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.schemas import CodeReviewRequest, SystemDesignReviewRequest, ValidationError
 from lad_mcp_server.serena_bridge import BASELINE_REQUIRED_MEMORIES, SerenaContext, SerenaLimits, SerenaToolError
 from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
+from lad_mcp_server.zai_coding_client import ZaiCodingClient, is_zai_model, normalize_zai_model_name
 
 
 log = logging.getLogger(__name__)
@@ -177,6 +178,8 @@ class ReviewerOutcome:
     serena_used_paths: tuple[str, ...]
     markdown: str
     error: str | None
+    provider: str = "openrouter"
+    provider_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,8 @@ class ReviewerConfig:
     tool_choice_supported: bool
     serena_ctx: SerenaContext | None
     serena_disabled_reason: str | None
+    use_zai_direct: bool = False
+    direct_model_name: str | None = None
 
 
 class ReviewService:
@@ -198,6 +203,7 @@ class ReviewService:
         settings: Settings | None = None,
         openrouter_client: OpenRouterClient | None = None,
         models_client: OpenRouterModelsClient | None = None,
+        zai_client: ZaiCodingClient | Any | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._openrouter = openrouter_client or OpenRouterClient(
@@ -210,6 +216,12 @@ class ReviewService:
             api_key=self._settings.openrouter_api_key,
             ttl_seconds=self._settings.openrouter_model_metadata_ttl_seconds,
         )
+        self._zai = zai_client
+        if self._zai is None and self._settings.zai_coding_plan_key:
+            self._zai = ZaiCodingClient(
+                api_key=self._settings.zai_coding_plan_key,
+                max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
+            )
         # NOTE: `repo_root` here is treated as a *default* only.
         # The reviewed project is inferred per tool invocation (prefer CODEX_WORKSPACE_ROOT; otherwise absolute-path
         # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
@@ -327,6 +339,52 @@ class ReviewService:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("OpenRouter fallback call ended without result")
+
+    async def _call_model_with_provider_fallback(
+        self,
+        *,
+        model: str,
+        direct_model_name: str | None,
+        use_zai_direct: bool,
+        messages: list[dict[str, Any]],
+        timeout_seconds: int,
+        max_output_tokens: int,
+        tools: list[dict[str, Any]] | None,
+        preferred_tool_choice: str | dict[str, Any] | None,
+        extra_body: dict[str, Any] | None,
+        provider_used: list[str],
+        provider_notes: list[str],
+    ) -> OpenRouterCallResult:
+        if use_zai_direct and self._zai is not None and direct_model_name:
+            try:
+                result = await self._zai.chat_completion(
+                    model=direct_model_name,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    extra_body=extra_body,
+                )
+                provider_used[:] = ["zai_coding_plan"]
+                return result
+            except Exception as exc:
+                note = f"Z.AI Coding Plan endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                if not provider_notes:
+                    provider_notes.append(note)
+                provider_used[:] = ["openrouter"]
+                log.warning("Direct Z.AI call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+
+        provider_used[:] = ["openrouter"]
+        return await self._call_openrouter_with_tool_choice_fallback(
+            model=model,
+            messages=messages,
+            timeout_seconds=timeout_seconds,
+            max_output_tokens=max_output_tokens,
+            tools=tools,
+            preferred_tool_choice=preferred_tool_choice,
+            extra_body=extra_body,
+        )
 
     @staticmethod
     def _walk_up_for_project_root(start: Path, *, max_depth: int = 25) -> Path:
@@ -536,6 +594,9 @@ class ReviewService:
         lines = []
         lines.append("---")
         lines.append(f"*Model: `{outcome.model}`*")
+        lines.append(f"*Provider: `{outcome.provider}`*")
+        if outcome.provider_note:
+            lines.append(f"*Provider note: {outcome.provider_note}*")
         if outcome.used_serena:
             lines.append("*Serena tools used: yes*")
             if outcome.serena_activated_project is not None:
@@ -582,19 +643,45 @@ class ReviewService:
         return f"Both reviewers failed.\n- Primary error: {primary.error}\n- Secondary error: {secondary.error}"
 
     def _prepare_reviewer_config(self, model: str, *, repo_root: Path) -> ReviewerConfig:
-        try:
-            meta = self._models.get_model(model)
+        use_zai_direct = (
+            bool(self._settings.zai_coding_plan_key)
+            and self._zai is not None
+            and is_zai_model(model)
+        )
+        direct_model_name = normalize_zai_model_name(model) if use_zai_direct else None
+
+        if use_zai_direct:
+            input_budget_tokens = max(self._settings.openrouter_max_input_chars // CHARS_PER_TOKEN_ESTIMATE, 1)
             budget = TokenBudget(
-                effective_context_length=meta.effective_context_length(),
-                effective_output_budget=meta.effective_output_budget(self._settings.openrouter_fixed_output_tokens),
+                effective_context_length=(
+                    input_budget_tokens
+                    + self._settings.openrouter_fixed_output_tokens
+                    + self._settings.openrouter_context_overhead_tokens
+                ),
+                effective_output_budget=self._settings.openrouter_fixed_output_tokens,
                 overhead_tokens=self._settings.openrouter_context_overhead_tokens,
             )
-            budget.validate()
-        except (ModelMetadataError, TokenBudgetError) as exc:
-            # Fail closed: prevent any LLM calls if model metadata/budget cannot be established.
-            raise RuntimeError(f"Model metadata/budget error for {model}: {exc}") from exc
+            try:
+                budget.validate()
+            except TokenBudgetError as exc:
+                raise RuntimeError(f"Model budget error for {model}: {exc}") from exc
+            supported_parameters: tuple[str, ...] = ("tools", "tool_choice", "max_tokens")
+            tool_calling_supported = True
+        else:
+            try:
+                meta = self._models.get_model(model)
+                budget = TokenBudget(
+                    effective_context_length=meta.effective_context_length(),
+                    effective_output_budget=meta.effective_output_budget(self._settings.openrouter_fixed_output_tokens),
+                    overhead_tokens=self._settings.openrouter_context_overhead_tokens,
+                )
+                budget.validate()
+            except (ModelMetadataError, TokenBudgetError) as exc:
+                # Fail closed: prevent any LLM calls if model metadata/budget cannot be established.
+                raise RuntimeError(f"Model metadata/budget error for {model}: {exc}") from exc
+            supported_parameters = meta.supported_parameters
+            tool_calling_supported = meta.supports_tools()
 
-        tool_calling_supported = meta.supports_tools()
         serena_ctx = None
         serena_disabled_reason = None
 
@@ -625,11 +712,13 @@ class ReviewService:
         return ReviewerConfig(
             model=model,
             budget=budget,
-            supported_parameters=meta.supported_parameters,
+            supported_parameters=supported_parameters,
             tool_calling_supported=tool_calling_supported,
-            tool_choice_supported="tool_choice" in meta.supported_parameters,
+            tool_choice_supported="tool_choice" in supported_parameters,
             serena_ctx=serena_ctx,
             serena_disabled_reason=serena_disabled_reason,
+            use_zai_direct=use_zai_direct,
+            direct_model_name=direct_model_name,
         )
 
     async def _run_single_reviewer(
@@ -703,11 +792,13 @@ class ReviewService:
         if "max_completion_tokens" in cfg.supported_parameters:
             extra_body["max_completion_tokens"] = budget.effective_output_budget
         extra_body_to_send = extra_body or None
+        provider_used = ["openrouter"]
+        provider_notes: list[str] = []
 
         try:
-            # Enforce a wall-clock cap for the whole reviewer run (including multiple OpenRouter calls and tool calls).
-            async with asyncio.timeout(self._settings.openrouter_reviewer_timeout_seconds):
-                markdown = await self._tool_loop(
+            # Enforce a wall-clock cap for the whole reviewer run (including multiple model calls and tool calls).
+            markdown = await asyncio.wait_for(
+                self._tool_loop(
                     model=model,
                     messages=messages,
                     tools=tools,
@@ -718,7 +809,13 @@ class ReviewService:
                     max_output_tokens=budget.effective_output_budget,
                     max_tool_calls=self._settings.lad_serena_max_tool_calls,
                     tool_timeout_seconds=self._settings.lad_serena_tool_timeout_seconds,
-                )
+                    use_zai_direct=cfg.use_zai_direct,
+                    direct_model_name=cfg.direct_model_name,
+                    provider_used=provider_used,
+                    provider_notes=provider_notes,
+                ),
+                timeout=self._settings.openrouter_reviewer_timeout_seconds,
+            )
             used_serena = serena_ctx is not None and (
                 serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths
             )
@@ -733,8 +830,10 @@ class ReviewService:
                 serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
                 markdown=markdown,
                 error=None,
+                provider=provider_used[0],
+                provider_note=provider_notes[0] if provider_notes else None,
             )
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
             msg = f"Reviewer timed out after {self._settings.openrouter_reviewer_timeout_seconds}s"
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
@@ -749,6 +848,8 @@ class ReviewService:
                 serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
                 markdown=_format_reviewer_error(model, msg),
                 error=msg,
+                provider=provider_used[0],
+                provider_note=provider_notes[0] if provider_notes else None,
             )
         except Exception as exc:
             msg = _exc_message(exc)
@@ -763,6 +864,8 @@ class ReviewService:
                 serena_used_paths=(),
                 markdown=_format_reviewer_error(model, msg),
                 error=msg,
+                provider=provider_used[0],
+                provider_note=provider_notes[0] if provider_notes else None,
             )
 
     async def _tool_loop(
@@ -778,7 +881,15 @@ class ReviewService:
         max_output_tokens: int,
         max_tool_calls: int,
         tool_timeout_seconds: int,
+        use_zai_direct: bool = False,
+        direct_model_name: str | None = None,
+        provider_used: list[str] | None = None,
+        provider_notes: list[str] | None = None,
     ) -> str:
+        if provider_used is None:
+            provider_used = ["openrouter"]
+        if provider_notes is None:
+            provider_notes = []
         remaining_tool_calls = max_tool_calls
         did_force_project_overview = False
         did_force_baseline_memories = False
@@ -823,14 +934,18 @@ class ReviewService:
                 1,
             )
 
-            result = await self._call_openrouter_with_tool_choice_fallback(
+            result = await self._call_model_with_provider_fallback(
                 model=model,
+                direct_model_name=direct_model_name,
+                use_zai_direct=use_zai_direct,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
                 tools=tools,
                 preferred_tool_choice=tool_choice,
                 extra_body=extra_body,
+                provider_used=provider_used,
+                provider_notes=provider_notes,
             )
 
             if not result.tool_calls:
