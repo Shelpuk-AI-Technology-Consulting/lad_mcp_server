@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
-import re
 import threading
 import urllib.error
 import urllib.request
@@ -13,25 +12,24 @@ from typing import Any
 from lad_mcp_server.openrouter_client import OpenRouterCallResult
 
 
-_ZAI_PREFIX_RE = re.compile(r"^z-?ai/", re.IGNORECASE)
-ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+_KIMI_DIRECT_MODEL = "kimi-for-coding"
 
 
-class ZaiCodingClientError(RuntimeError):
+class KimiCodeClientError(RuntimeError):
     pass
 
 
-def is_zai_model(model: str) -> bool:
+def is_kimi_model(model: str) -> bool:
     if not isinstance(model, str):
         return False
-    return _ZAI_PREFIX_RE.match(model.strip()) is not None
+    return model.strip().lower() == "moonshotai/kimi-k2.5"
 
 
-def normalize_zai_model_name(model: str) -> str:
+def normalize_kimi_model_name(model: str) -> str:
     if not isinstance(model, str):
-        return model
-    normalized = _ZAI_PREFIX_RE.sub("", model.strip(), count=1)
-    return normalized if normalized else model.strip()
+        return _KIMI_DIRECT_MODEL
+    return _KIMI_DIRECT_MODEL
 
 
 def _normalize_tool_calls(tool_calls_obj: Any) -> list[dict[str, Any]]:
@@ -57,13 +55,13 @@ def _normalize_tool_calls(tool_calls_obj: Any) -> list[dict[str, Any]]:
     return []
 
 
-class ZaiCodingClient:
+class KimiCodeClient:
     def __init__(
         self,
         *,
         api_key: str,
         max_concurrent_requests: int,
-        base_url: str = ZAI_CODING_BASE_URL,
+        base_url: str = KIMI_CODE_BASE_URL,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -165,19 +163,19 @@ class ZaiCodingClient:
                     body_text = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     body_text = ""
-                raise ZaiCodingClientError(
-                    f"Z.AI Coding endpoint HTTP {getattr(exc, 'code', 'error')}: {body_text[:300]}"
+                raise KimiCodeClientError(
+                    f"Kimi Code endpoint HTTP {getattr(exc, 'code', 'error')}: {body_text[:300]}"
                 ) from exc
             except Exception as exc:
-                raise ZaiCodingClientError(f"Z.AI Coding endpoint request failed: {exc}") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request failed: {exc}") from exc
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise ZaiCodingClientError("Z.AI Coding endpoint response was not valid JSON") from exc
+                raise KimiCodeClientError("Kimi Code endpoint response was not valid JSON") from exc
             if not isinstance(parsed, dict):
-                raise ZaiCodingClientError("Z.AI Coding endpoint response JSON was not an object")
+                raise KimiCodeClientError("Kimi Code endpoint response JSON was not an object")
             if "error" in parsed:
-                raise ZaiCodingClientError(f"Z.AI Coding endpoint error: {parsed.get('error')}")
+                raise KimiCodeClientError(f"Kimi Code endpoint error: {parsed.get('error')}")
             return parsed
 
         loop = asyncio.get_running_loop()
@@ -232,9 +230,9 @@ class ZaiCodingClient:
                     timeout=timeout_seconds,
                 )
             except asyncio.TimeoutError as exc:
-                raise ZaiCodingClientError(f"Z.AI Coding endpoint request timed out after {timeout_seconds}s") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request timed out after {timeout_seconds}s") from exc
             except Exception as exc:
-                raise ZaiCodingClientError(f"Z.AI Coding endpoint request failed: {exc}") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request failed: {exc}") from exc
 
         try:
             choice0 = response.choices[0]

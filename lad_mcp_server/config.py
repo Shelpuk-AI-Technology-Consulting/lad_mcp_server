@@ -80,6 +80,7 @@ class Settings:
     lad_serena_max_dir_entries: int
     lad_serena_max_search_results: int
     zai_coding_plan_key: str | None = None
+    kimi_code_api_key: str | None = None
 
     @staticmethod
     def from_env() -> "Settings":
@@ -160,4 +161,5 @@ class Settings:
             lad_serena_max_dir_entries=_get_int("LAD_SERENA_MAX_DIR_ENTRIES", 100),
             lad_serena_max_search_results=_get_int("LAD_SERENA_MAX_SEARCH_RESULTS", 20),
             zai_coding_plan_key=_get_str("ZAI_CODING_PLAN_KEY"),
+            kimi_code_api_key=_get_str("KIMI_CODE_API_KEY"),
         )

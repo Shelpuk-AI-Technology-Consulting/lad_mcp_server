@@ -29,6 +29,7 @@ from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.schemas import CodeReviewRequest, SystemDesignReviewRequest, ValidationError
 from lad_mcp_server.serena_bridge import BASELINE_REQUIRED_MEMORIES, SerenaContext, SerenaLimits, SerenaToolError
 from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
+from lad_mcp_server.kimi_code_client import KimiCodeClient, is_kimi_model, normalize_kimi_model_name
 from lad_mcp_server.zai_coding_client import ZaiCodingClient, is_zai_model, normalize_zai_model_name
 
 
@@ -193,6 +194,8 @@ class ReviewerConfig:
     serena_disabled_reason: str | None
     use_zai_direct: bool = False
     direct_model_name: str | None = None
+    use_kimi_direct: bool = False
+    direct_kimi_model_name: str | None = None
 
 
 class ReviewService:
@@ -204,6 +207,7 @@ class ReviewService:
         openrouter_client: OpenRouterClient | None = None,
         models_client: OpenRouterModelsClient | None = None,
         zai_client: ZaiCodingClient | Any | None = None,
+        kimi_client: KimiCodeClient | Any | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._openrouter = openrouter_client or OpenRouterClient(
@@ -220,6 +224,12 @@ class ReviewService:
         if self._zai is None and self._settings.zai_coding_plan_key:
             self._zai = ZaiCodingClient(
                 api_key=self._settings.zai_coding_plan_key,
+                max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
+            )
+        self._kimi = kimi_client
+        if self._kimi is None and self._settings.kimi_code_api_key:
+            self._kimi = KimiCodeClient(
+                api_key=self._settings.kimi_code_api_key,
                 max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
             )
         # NOTE: `repo_root` here is treated as a *default* only.
@@ -346,6 +356,8 @@ class ReviewService:
         model: str,
         direct_model_name: str | None,
         use_zai_direct: bool,
+        direct_kimi_model_name: str | None,
+        use_kimi_direct: bool,
         messages: list[dict[str, Any]],
         timeout_seconds: int,
         max_output_tokens: int,
@@ -374,6 +386,26 @@ class ReviewService:
                     provider_notes.append(note)
                 provider_used[:] = ["openrouter"]
                 log.warning("Direct Z.AI call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+
+        if use_kimi_direct and self._kimi is not None and direct_kimi_model_name:
+            try:
+                result = await self._kimi.chat_completion(
+                    model=direct_kimi_model_name,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    extra_body=extra_body,
+                )
+                provider_used[:] = ["kimi_code"]
+                return result
+            except Exception as exc:
+                note = f"Kimi Code endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                if not provider_notes:
+                    provider_notes.append(note)
+                provider_used[:] = ["openrouter"]
+                log.warning("Direct Kimi Code call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
         provider_used[:] = ["openrouter"]
         return await self._call_openrouter_with_tool_choice_fallback(
@@ -650,7 +682,14 @@ class ReviewService:
         )
         direct_model_name = normalize_zai_model_name(model) if use_zai_direct else None
 
-        if use_zai_direct:
+        use_kimi_direct = (
+            bool(self._settings.kimi_code_api_key)
+            and self._kimi is not None
+            and is_kimi_model(model)
+        )
+        direct_kimi_model_name = normalize_kimi_model_name(model) if use_kimi_direct else None
+
+        if use_zai_direct or use_kimi_direct:
             input_budget_tokens = max(self._settings.openrouter_max_input_chars // CHARS_PER_TOKEN_ESTIMATE, 1)
             budget = TokenBudget(
                 effective_context_length=(
@@ -719,6 +758,8 @@ class ReviewService:
             serena_disabled_reason=serena_disabled_reason,
             use_zai_direct=use_zai_direct,
             direct_model_name=direct_model_name,
+            use_kimi_direct=use_kimi_direct,
+            direct_kimi_model_name=direct_kimi_model_name,
         )
 
     async def _run_single_reviewer(
@@ -811,6 +852,8 @@ class ReviewService:
                     tool_timeout_seconds=self._settings.lad_serena_tool_timeout_seconds,
                     use_zai_direct=cfg.use_zai_direct,
                     direct_model_name=cfg.direct_model_name,
+                    use_kimi_direct=cfg.use_kimi_direct,
+                    direct_kimi_model_name=cfg.direct_kimi_model_name,
                     provider_used=provider_used,
                     provider_notes=provider_notes,
                 ),
@@ -883,6 +926,8 @@ class ReviewService:
         tool_timeout_seconds: int,
         use_zai_direct: bool = False,
         direct_model_name: str | None = None,
+        use_kimi_direct: bool = False,
+        direct_kimi_model_name: str | None = None,
         provider_used: list[str] | None = None,
         provider_notes: list[str] | None = None,
     ) -> str:
@@ -940,6 +985,8 @@ class ReviewService:
                 model=model,
                 direct_model_name=direct_model_name,
                 use_zai_direct=use_zai_direct,
+                direct_kimi_model_name=direct_kimi_model_name,
+                use_kimi_direct=use_kimi_direct,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
@@ -974,7 +1021,7 @@ class ReviewService:
 
             if serena_ctx is None or tools is None:
                 # Should not happen: model returned tool calls but tools weren't provided.
-                return (result.content or "") + "\n\n*(Tool calls were requested, but no tools were available.)\n"
+                return (result.content or "") + "\\n\\n*(Tool calls were requested, but no tools were available.)\\n"
 
             executable_tool_calls = result.tool_calls[: max(remaining_tool_calls, 0)]
             if executable_tool_calls:
