@@ -62,7 +62,7 @@ class OpenRouterClient:
         max_concurrent_requests: int,
     ) -> None:
         self._api_key = api_key
-        self._default_headers: dict[str, str] = {}
+        self._default_headers: dict[str, str] = {"User-Agent": "claude-code/1.0"}
         if http_referer:
             self._default_headers["HTTP-Referer"] = http_referer
         if x_title:

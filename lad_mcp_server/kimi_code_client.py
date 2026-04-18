@@ -27,8 +27,12 @@ def is_kimi_model(model: str) -> bool:
 
 
 def normalize_kimi_model_name(model: str) -> str:
-    if not isinstance(model, str):
-        return _KIMI_DIRECT_MODEL
+    """Translate the OpenRouter model name to the Kimi Code direct-endpoint model name.
+
+    The Kimi Code coding endpoint uses a single fixed model identifier
+    (``kimi-for-coding``) regardless of which OpenRouter-style variant was
+    requested, so this function always returns that constant.
+    """
     return _KIMI_DIRECT_MODEL
 
 
