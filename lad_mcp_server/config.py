@@ -137,9 +137,9 @@ class Settings:
         return Settings(
             openrouter_api_key=api_key,
             openrouter_primary_reviewer_model=_get_str(
-                "OPENROUTER_PRIMARY_REVIEWER_MODEL", "moonshotai/kimi-k2.5"
+                "OPENROUTER_PRIMARY_REVIEWER_MODEL", "google/gemma-4-31b-it"
             )
-            or "moonshotai/kimi-k2.5",
+            or "google/gemma-4-31b-it",
             openrouter_secondary_reviewer_model=_get_str(
                 "OPENROUTER_SECONDARY_REVIEWER_MODEL", "minimax/minimax-m2.7"
             )
