@@ -1743,6 +1743,537 @@ class TestReviewServiceToolLoop(unittest.TestCase):
             self.assertEqual(out, "")
             self.assertEqual(client.calls, 3)
 
+    def test_hallucinated_tool_call_after_budget_exhaustion_is_retried(self) -> None:
+        """After tools are disabled (budget exhausted), model hallucinates a tool call.
+        The loop should recover by injecting a hint and retrying once."""
+
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_hallucination_hint = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    # First call: real tool call (uses the only budget slot).
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                if self.calls == 2:
+                    # Second call: tools still in list, but remaining=0 so executable_tool_calls
+                    # will be empty. Then remaining<=0 sets tools=None.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                if self.calls == 3:
+                    # Third call: tools=None. Model hallucinates a tool call.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_hallucinated",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                # Fourth call: after recovery hint, model provides final review.
+                self.saw_hallucination_hint = any(
+                    msg.get("role") == "system"
+                    and "tools are no longer available" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "final-review", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=5,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=1,  # budget=1 so it exhausts after the first tool call
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertIn("final-review", out)
+            self.assertNotIn("no tools were available", out)
+            self.assertEqual(client.calls, 4)
+            self.assertTrue(client.saw_hallucination_hint)
+
+    def test_hallucinated_tool_call_after_degradation_guard_is_retried(self) -> None:
+        """After tools are disabled (consecutive degradation guard), model hallucinates.
+        The loop should recover by injecting a hint and retrying once."""
+
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""  # empty output → degraded
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_hallucination_hint = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls in (1, 2):
+                    # First two calls: real tool calls with degraded (empty) output.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{self.calls}",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                if self.calls == 3:
+                    # Third call: tools=None (degradation guard triggered), model hallucinates.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_hallucinated",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                # Fourth call: after recovery hint, model provides final review.
+                self.saw_hallucination_hint = any(
+                    msg.get("role") == "system"
+                    and "tools are no longer available" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "final-review", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=5,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=5,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertIn("final-review", out)
+            self.assertNotIn("no tools were available", out)
+            self.assertEqual(client.calls, 4)
+            self.assertTrue(client.saw_hallucination_hint)
+
+    def test_hallucinated_tool_call_retry_is_one_shot(self) -> None:
+        """If model hallucinates tool calls twice after tools are disabled, the second
+        hallucination returns content with degradation summary (not infinite loop)."""
+
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    # First call: real tool call (uses the only budget slot).
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                if self.calls == 2:
+                    # Second call: tools still in list, but remaining=0 so executable_tool_calls
+                    # will be empty. Then remaining<=0 sets tools=None.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                # All subsequent calls (tools=None): model keeps hallucinating tool calls.
+                return type(
+                    "R",
+                    (),
+                    {
+                        "content": "partial-review",
+                        "tool_calls": [
+                            {
+                                "id": f"call_hall_{self.calls}",
+                                "type": "function",
+                                "function": {"name": "list_dir", "arguments": "{}"},
+                            }
+                        ],
+                        "raw": {},
+                    },
+                )()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=5,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=1,  # budget=1 so it exhausts after first tool call
+                    tool_timeout_seconds=1,
+                )
+            )
+            # Call 3 (first hallucination with tools=None) is retried,
+            # call 4 (second hallucination) causes early return with degradation summary.
+            self.assertIn("partial-review", out)
+            self.assertNotIn("no tools were available", out)
+            self.assertEqual(client.calls, 4)
+
+    def test_hallucinated_tool_call_when_serena_ctx_is_none(self) -> None:
+        """When serena_ctx is None (Serena not activated), model hallucinates a tool call.
+        The loop should recover by injecting a hint and retrying once."""
+
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_hallucination_hint = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    # First call: model tries a tool call despite no serena_ctx.
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+                # Second call: after recovery hint, model provides final review.
+                self.saw_hallucination_hint = any(
+                    msg.get("role") == "system"
+                    and "tools are no longer available" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "final-review", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=5,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=None,  # serena_ctx is None — tools were never enabled
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=5,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertIn("final-review", out)
+            self.assertNotIn("no tools were available", out)
+            self.assertEqual(client.calls, 2)
+            self.assertTrue(client.saw_hallucination_hint)
+
 
 if __name__ == "__main__":
     unittest.main()

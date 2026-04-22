@@ -947,6 +947,7 @@ class ReviewService:
         consecutive_guard_triggered = False
         had_tool_interaction = False
         empty_post_tool_retry_used = False
+        tools_disabled_hallucination_retry_used = False
 
         while True:
             tool_choice: str | dict[str, Any] | None = "auto" if tools else None
@@ -1020,8 +1021,20 @@ class ReviewService:
                 )
 
             if serena_ctx is None or tools is None:
-                # Should not happen: model returned tool calls but tools weren't provided.
-                return (result.content or "") + "\\n\\n*(Tool calls were requested, but no tools were available.)\\n"
+                # Model returned tool calls despite tools being disabled (hallucination).
+                # Attempt one-shot recovery by injecting a hint; if it happens again, return what we have.
+                if not tools_disabled_hallucination_retry_used:
+                    tools_disabled_hallucination_retry_used = True
+                    messages.append(_build_system_message(
+                        "You attempted to use a tool, but tools are no longer available. "
+                        "Provide your final review in plain markdown without any tool calls."
+                    ))
+                    continue
+                return _append_tooling_degradation_summary(
+                    result.content or "",
+                    degraded_outputs_count=degraded_outputs_count,
+                    consecutive_guard_triggered=consecutive_guard_triggered,
+                )
 
             executable_tool_calls = result.tool_calls[: max(remaining_tool_calls, 0)]
             if executable_tool_calls:
