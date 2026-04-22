@@ -109,6 +109,12 @@ class TestKimiRouting(unittest.TestCase):
                     supported_parameters=("max_tokens",),
                     provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
                 ),
+                "moonshotai/kimi-k2.6": ModelMetadata(
+                    model_id="moonshotai/kimi-k2.6",
+                    context_length=50000,
+                    supported_parameters=("max_tokens",),
+                    provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                ),
                 "other/model": ModelMetadata(
                     model_id="other/model",
                     context_length=50000,
@@ -183,6 +189,45 @@ class TestKimiRouting(unittest.TestCase):
         self.assertIn("OpenRouter OK", out)
         self.assertEqual(len(openrouter.calls), 1)
         self.assertEqual(len(kimi.calls), 0)
+
+    def test_uses_direct_kimi_for_kimi_k2_6_when_key_present(self) -> None:
+        openrouter = _OpenRouterStub()
+        kimi = _KimiStub(fail=False)
+        service = ReviewService(
+            settings=self._settings(model="moonshotai/kimi-k2.6", kimi_key="kimi-key"),
+            openrouter_client=openrouter,
+            models_client=self._models(),
+            kimi_client=kimi,
+        )
+
+        out = asyncio.run(service.code_review(code="print('x')", context=None, paths=None))
+
+        self.assertIn("Kimi Code OK", out)
+        self.assertEqual(len(kimi.calls), 1)
+        self.assertEqual(kimi.calls[0]["model"], "kimi-for-coding")
+        self.assertEqual(len(openrouter.calls), 0)
+
+    def test_kimi_fallback_cache_prevents_retry(self) -> None:
+        openrouter = _OpenRouterStub()
+        kimi = _KimiStub(fail=True)
+        service = ReviewService(
+            settings=self._settings(model="moonshotai/kimi-k2.5", kimi_key="kimi-key"),
+            openrouter_client=openrouter,
+            models_client=self._models(),
+            kimi_client=kimi,
+        )
+
+        # First call: Kimi fails, falls back to OpenRouter, caches the failure.
+        out1 = asyncio.run(service.code_review(code="print('x')", context=None, paths=None))
+        self.assertIn("OpenRouter OK", out1)
+        self.assertEqual(len(kimi.calls), 1)
+        self.assertEqual(len(openrouter.calls), 1)
+
+        # Second call: Kimi failure is cached, so only OpenRouter is called.
+        out2 = asyncio.run(service.code_review(code="print('y')", context=None, paths=None))
+        self.assertIn("OpenRouter OK", out2)
+        self.assertEqual(len(kimi.calls), 1)  # no additional Kimi call
+        self.assertEqual(len(openrouter.calls), 2)
 
 
 if __name__ == "__main__":

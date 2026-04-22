@@ -39,6 +39,8 @@ CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for mixed tokenizers
 OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS = 5  # avoid racing external tool-call deadlines
 TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
+KIMI_FALLBACK_TTL_SECONDS = 600
+KIMI_FALLBACK_CACHE_MAX_MODELS = 128
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -239,6 +241,8 @@ class ReviewService:
         self._tool_executor = _TOOL_EXECUTOR
         self._tool_choice_fallback_until_by_model: dict[str, float] = {}
         self._tool_choice_fallback_lock = threading.Lock()
+        self._kimi_fallback_until_by_model: dict[str, float] = {}
+        self._kimi_fallback_lock = threading.Lock()
 
     @staticmethod
     def _tool_choice_model_key(model: str) -> str:
@@ -276,6 +280,42 @@ class ReviewService:
         while len(self._tool_choice_fallback_until_by_model) > TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS:
             oldest_key = min(self._tool_choice_fallback_until_by_model, key=self._tool_choice_fallback_until_by_model.get)
             self._tool_choice_fallback_until_by_model.pop(oldest_key, None)
+
+    def _kimi_model_key(self, model: str) -> str:
+        return model.strip()
+
+    def _is_kimi_fallback_active(self, model: str) -> bool:
+        key = self._kimi_model_key(model)
+        now = time.monotonic()
+        with self._kimi_fallback_lock:
+            expires_at = self._kimi_fallback_until_by_model.get(key)
+            if expires_at is None:
+                self._cleanup_kimi_fallback_cache_locked(now)
+                return False
+            if expires_at <= now:
+                self._kimi_fallback_until_by_model.pop(key, None)
+                self._cleanup_kimi_fallback_cache_locked(now)
+                return False
+            self._cleanup_kimi_fallback_cache_locked(now)
+            return True
+
+    def _remember_kimi_fallback(self, model: str) -> None:
+        key = self._kimi_model_key(model)
+        now = time.monotonic()
+        with self._kimi_fallback_lock:
+            already_active = (self._kimi_fallback_until_by_model.get(key) or 0.0) > now
+            self._kimi_fallback_until_by_model[key] = now + float(KIMI_FALLBACK_TTL_SECONDS)
+            self._cleanup_kimi_fallback_cache_locked(now)
+        if not already_active:
+            log.info("Kimi Code fallback cache activated for model '%s' (%ss)", key, KIMI_FALLBACK_TTL_SECONDS)
+
+    def _cleanup_kimi_fallback_cache_locked(self, now: float) -> None:
+        expired = [k for k, v in self._kimi_fallback_until_by_model.items() if v <= now]
+        for k in expired:
+            self._kimi_fallback_until_by_model.pop(k, None)
+        while len(self._kimi_fallback_until_by_model) > KIMI_FALLBACK_CACHE_MAX_MODELS:
+            oldest_key = min(self._kimi_fallback_until_by_model, key=self._kimi_fallback_until_by_model.get)
+            self._kimi_fallback_until_by_model.pop(oldest_key, None)
 
     @staticmethod
     def _is_retryable_tool_choice_compatibility_error(exc: OpenRouterClientError) -> bool:
@@ -388,24 +428,26 @@ class ReviewService:
                 log.warning("Direct Z.AI call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
         if use_kimi_direct and self._kimi is not None and direct_kimi_model_name:
-            try:
-                result = await self._kimi.chat_completion(
-                    model=direct_kimi_model_name,
-                    messages=messages,
-                    timeout_seconds=timeout_seconds,
-                    max_output_tokens=max_output_tokens,
-                    tools=tools,
-                    tool_choice=preferred_tool_choice,
-                    extra_body=extra_body,
-                )
-                provider_used[:] = ["kimi_code"]
-                return result
-            except Exception as exc:
-                note = f"Kimi Code endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                if not provider_notes:
-                    provider_notes.append(note)
-                provider_used[:] = ["openrouter"]
-                log.warning("Direct Kimi Code call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+            if not self._is_kimi_fallback_active(model):
+                try:
+                    result = await self._kimi.chat_completion(
+                        model=direct_kimi_model_name,
+                        messages=messages,
+                        timeout_seconds=timeout_seconds,
+                        max_output_tokens=max_output_tokens,
+                        tools=tools,
+                        tool_choice=preferred_tool_choice,
+                        extra_body=extra_body,
+                    )
+                    provider_used[:] = ["kimi_code"]
+                    return result
+                except Exception as exc:
+                    self._remember_kimi_fallback(model)
+                    note = f"Kimi Code endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                    if not provider_notes:
+                        provider_notes.append(note)
+                    provider_used[:] = ["openrouter"]
+                    log.warning("Direct Kimi Code call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
         provider_used[:] = ["openrouter"]
         return await self._call_openrouter_with_tool_choice_fallback(
