@@ -60,7 +60,7 @@ class TestSettingsTimeoutDefaults(unittest.TestCase):
         os.environ.pop("OPENROUTER_SECONDARY_REVIEWER_MODEL", None)
 
         s = Settings.from_env()
-        self.assertEqual(s.openrouter_primary_reviewer_model, "moonshotai/kimi-k2.5")
+        self.assertEqual(s.openrouter_primary_reviewer_model, "google/gemma-4-31b-it")
         self.assertEqual(s.openrouter_secondary_reviewer_model, "minimax/minimax-m2.7")
 
     def test_zai_coding_plan_key_is_optional(self) -> None:
