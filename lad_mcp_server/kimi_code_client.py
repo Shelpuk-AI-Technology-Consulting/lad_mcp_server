@@ -23,7 +23,8 @@ class KimiCodeClientError(RuntimeError):
 def is_kimi_model(model: str) -> bool:
     if not isinstance(model, str):
         return False
-    return model.strip().lower().startswith("moonshotai/")
+    normalized = model.strip().lower()
+    return normalized == "kimi-for-coding" or normalized.startswith("moonshotai/")
 
 
 def normalize_kimi_model_name(model: str) -> str:

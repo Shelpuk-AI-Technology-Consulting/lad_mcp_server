@@ -7,6 +7,8 @@ class TestKimiCodeClientHelpers(unittest.TestCase):
         self.assertTrue(is_kimi_model("moonshotai/kimi-k2.6"))
         self.assertTrue(is_kimi_model("MOONSHOTAI/KIMI-K2.6"))
         self.assertTrue(is_kimi_model("moonshotai/other-model"))
+        self.assertTrue(is_kimi_model("kimi-for-coding"))
+        self.assertTrue(is_kimi_model("KIMI-FOR-CODING"))
         self.assertFalse(is_kimi_model("z-ai/glm-5"))
         self.assertFalse(is_kimi_model("other/model"))
 

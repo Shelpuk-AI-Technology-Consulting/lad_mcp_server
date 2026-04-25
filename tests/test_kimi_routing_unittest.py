@@ -190,6 +190,23 @@ class TestKimiRouting(unittest.TestCase):
         self.assertEqual(len(openrouter.calls), 1)
         self.assertEqual(len(kimi.calls), 0)
 
+    def test_uses_direct_kimi_for_kimi_for_coding_when_key_present(self) -> None:
+        openrouter = _OpenRouterStub()
+        kimi = _KimiStub(fail=False)
+        service = ReviewService(
+            settings=self._settings(model="kimi-for-coding", kimi_key="kimi-key"),
+            openrouter_client=openrouter,
+            models_client=self._models(),
+            kimi_client=kimi,
+        )
+
+        out = asyncio.run(service.code_review(code="print('x')", context=None, paths=None))
+
+        self.assertIn("Kimi Code OK", out)
+        self.assertEqual(len(kimi.calls), 1)
+        self.assertEqual(kimi.calls[0]["model"], "kimi-for-coding")
+        self.assertEqual(len(openrouter.calls), 0)
+
     def test_uses_direct_kimi_for_kimi_k2_6_when_key_present(self) -> None:
         openrouter = _OpenRouterStub()
         kimi = _KimiStub(fail=False)
