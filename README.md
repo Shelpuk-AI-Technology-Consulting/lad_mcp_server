@@ -427,7 +427,7 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 - `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2.5`)
 - `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `minimax/minimax-m2.7`)
   - Set to `0` to disable the Secondary reviewer (Primary-only mode).
-  - Set to `kimi-for-coding` to use the direct Kimi Code endpoint when `KIMI_CODE_API_KEY` is configured; Lad will not send that model name to OpenRouter.
+  - Set to `kimi-for-coding` (or any `moonshotai/` model) to bypass OpenRouter entirely and route directly to the Kimi Code endpoint when `KIMI_CODE_API_KEY` is configured.
 
 ### OpenRouter request behavior
 
