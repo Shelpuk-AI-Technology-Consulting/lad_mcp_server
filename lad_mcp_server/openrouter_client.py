@@ -118,7 +118,7 @@ class OpenRouterClient:
                 return self._client
             try:
                 from openai import AsyncOpenAI
-            except Exception as exc:  # pragma: no cover
+            except Exception:  # pragma: no cover
                 # Fall back to stdlib HTTP client when `openai` isn't installed. This is primarily for
                 # environments where installing packages is unavailable.
                 self._client = "stdlib"

@@ -918,7 +918,7 @@ class ReviewService:
                 provider=provider_used[0],
                 provider_note=provider_notes[0] if provider_notes else None,
             )
-        except (TimeoutError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, asyncio.TimeoutError):
             # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
             msg = f"Reviewer timed out after {self._settings.openrouter_reviewer_timeout_seconds}s"
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
