@@ -9,7 +9,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from lad_mcp_server.openrouter_client import OpenRouterCallResult
+from lad_mcp_server.openrouter_client import OpenRouterCallResult, extract_reasoning_content, strip_reasoning_content
 
 
 KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
@@ -140,9 +140,13 @@ class KimiCodeClient:
             "User-Agent": "claude-code/1.0",
         }
 
+        # Kimi Code endpoint does not document `reasoning_content` support — strip it from outgoing
+        # messages to avoid 4xx schema rejections.
+        sanitized_messages = strip_reasoning_content(messages)
+
         body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": sanitized_messages,
             "max_tokens": max_output_tokens,
         }
         if tools is not None:
@@ -191,11 +195,18 @@ class KimiCodeClient:
             msg = choice0.get("message") or {}
             content = msg.get("content")
             tool_calls = _normalize_tool_calls(msg.get("tool_calls"))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=parsed)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=parsed,
+            reasoning_content=reasoning_content,
+        )
 
     async def chat_completion(
         self,
@@ -222,15 +233,17 @@ class KimiCodeClient:
                     extra_body=extra_body,
                 )
 
+            sanitized_messages = strip_reasoning_content(messages)
             try:
                 response = await asyncio.wait_for(
                     client.chat.completions.create(
                         model=model,
-                        messages=messages,
+                        messages=sanitized_messages,
                         tools=tools,
                         tool_choice=tool_choice,
                         max_tokens=max_output_tokens,
                         extra_body=extra_body,
+                        timeout=timeout_seconds,
                     ),
                     timeout=timeout_seconds,
                 )
@@ -244,8 +257,15 @@ class KimiCodeClient:
             msg = choice0.message
             content = getattr(msg, "content", None)
             tool_calls = _normalize_tool_calls(getattr(msg, "tool_calls", None))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=response)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=response,
+            reasoning_content=reasoning_content,
+        )

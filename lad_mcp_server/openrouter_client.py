@@ -19,12 +19,53 @@ class OpenRouterCallResult:
     """
     Normalized view of a chat completion response.
 
-    We normalize only what this project needs: assistant content + tool calls (if any).
+    We normalize only what this project needs: assistant content + tool calls (if any) +
+    reasoning_content (when the model produced hidden reasoning tokens — e.g., GLM-5).
     """
 
     content: str | None
     tool_calls: list[dict[str, Any]]
     raw: Any
+    reasoning_content: str | None = None
+
+
+def extract_reasoning_content(msg: Any) -> str | None:
+    """
+    Extract `reasoning_content` from a response message.
+
+    Handles three message shapes:
+    - dict (stdlib HTTP path, OpenRouter raw, test fakes)
+    - Pydantic-style SDK object with direct attribute access
+    - Pydantic SDK object where the field lives in `model_extra` (when not in the type definition)
+    """
+    if isinstance(msg, dict):
+        v = msg.get("reasoning_content")
+    else:
+        v = getattr(msg, "reasoning_content", None)
+        if v is None:
+            extra = getattr(msg, "model_extra", None) or {}
+            if isinstance(extra, dict):
+                v = extra.get("reasoning_content")
+    return v if isinstance(v, str) and v != "" else None
+
+
+def strip_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Return a copy of `messages` where every entry has its `reasoning_content` key removed.
+
+    Z.AI Coding Plan requires assistant messages to carry the full prior `reasoning_content`
+    across tool-call rounds (Preserved Thinking). Other providers (OpenRouter, Moonshot) may
+    reject the unknown key with a 4xx — so we strip before forwarding to them.
+
+    Does not mutate the input list/entries.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if isinstance(m, dict) and "reasoning_content" in m:
+            out.append({k: v for k, v in m.items() if k != "reasoning_content"})
+        else:
+            out.append(m)
+    return out
 
 
 def _normalize_tool_calls(tool_calls_obj: Any) -> list[dict[str, Any]]:
@@ -149,9 +190,12 @@ class OpenRouterClient:
         }
         headers.update(self._default_headers)
 
+        # OpenRouter does not accept `reasoning_content` on assistant messages; strip before sending.
+        sanitized_messages = strip_reasoning_content(messages)
+
         body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": sanitized_messages,
             "max_tokens": max_output_tokens,
         }
         if tools is not None:
@@ -192,11 +236,18 @@ class OpenRouterClient:
             msg = choice0.get("message") or {}
             content = msg.get("content")
             tool_calls = _normalize_tool_calls(msg.get("tool_calls"))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=parsed)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=parsed,
+            reasoning_content=reasoning_content,
+        )
 
     async def chat_completion(
         self,
@@ -226,15 +277,22 @@ class OpenRouterClient:
                     extra_body=extra_body,
                 )
 
+            # Strip `reasoning_content` from outgoing messages — OpenRouter / upstream providers
+            # do not accept the field on assistant messages and may return 4xx if it's present.
+            sanitized_messages = strip_reasoning_content(messages)
             try:
+                # `timeout=` on the SDK call ensures the underlying httpx idle/read timeout matches
+                # our wait_for budget; without it, reasoning models can trigger a spurious early
+                # APITimeoutError between reasoning tokens.
                 response = await asyncio.wait_for(
                     client.chat.completions.create(
                         model=model,
-                        messages=messages,
+                        messages=sanitized_messages,
                         tools=tools,
                         tool_choice=tool_choice,
                         max_tokens=max_output_tokens,
                         extra_body=extra_body,
+                        timeout=timeout_seconds,
                     ),
                     timeout=timeout_seconds,
                 )
@@ -249,8 +307,15 @@ class OpenRouterClient:
             msg = choice0.message
             content = getattr(msg, "content", None)
             tool_calls = _normalize_tool_calls(getattr(msg, "tool_calls", None))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=response)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=response,
+            reasoning_content=reasoning_content,
+        )

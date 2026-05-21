@@ -93,3 +93,20 @@ def user_prompt_code_review(*, code: str, context: str | None) -> str:
 
 def force_finalize_system_message() -> str:
     return "You have reached the maximum tool call budget. Provide your final review now without further tool calls."
+
+
+def intermittent_review_finalize_user_message() -> str:
+    """
+    User-role nudge for an intermittent (partial) review snapshot.
+
+    Sent as a user message (not system) to avoid provider quirks with mid-chain system messages.
+    The side call is dispatched with `tools=None`, so the model has no tools available to call —
+    there is no need to instruct it to refrain from tool use.
+    """
+    return (
+        "PARTIAL REVIEW REQUESTED. Based on everything you have explored and gathered so far in this "
+        "conversation, produce your best partial review NOW. Use these markdown sections exactly: "
+        "`## Summary`, `## Key Findings`, `## Recommendations`, `## Questions / Unknowns`. "
+        "Where you would otherwise have explored further, mark the gap explicitly under "
+        "`## Questions / Unknowns` so the caller knows what is incomplete."
+    )

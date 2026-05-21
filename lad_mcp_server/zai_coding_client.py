@@ -10,7 +10,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from lad_mcp_server.openrouter_client import OpenRouterCallResult
+from lad_mcp_server.openrouter_client import OpenRouterCallResult, extract_reasoning_content
 
 
 _ZAI_PREFIX_RE = re.compile(r"^z-?ai/", re.IGNORECASE)
@@ -188,11 +188,18 @@ class ZaiCodingClient:
             msg = choice0.get("message") or {}
             content = msg.get("content")
             tool_calls = _normalize_tool_calls(msg.get("tool_calls"))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=parsed)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=parsed,
+            reasoning_content=reasoning_content,
+        )
 
     async def chat_completion(
         self,
@@ -219,6 +226,11 @@ class ZaiCodingClient:
                     extra_body=extra_body,
                 )
 
+            # Z.AI Coding Plan supports Preserved Thinking — we deliberately do NOT strip
+            # `reasoning_content` from outgoing assistant messages. Pass `timeout=` to the SDK
+            # so its idle read-timeout matches our outer wait_for budget; reasoning models like
+            # GLM-5 pause between hidden reasoning tokens and would otherwise trip a spurious
+            # early APITimeoutError.
             try:
                 response = await asyncio.wait_for(
                     client.chat.completions.create(
@@ -228,6 +240,7 @@ class ZaiCodingClient:
                         tool_choice=tool_choice,
                         max_tokens=max_output_tokens,
                         extra_body=extra_body,
+                        timeout=timeout_seconds,
                     ),
                     timeout=timeout_seconds,
                 )
@@ -241,8 +254,15 @@ class ZaiCodingClient:
             msg = choice0.message
             content = getattr(msg, "content", None)
             tool_calls = _normalize_tool_calls(getattr(msg, "tool_calls", None))
+            reasoning_content = extract_reasoning_content(msg)
         except Exception:
             content = None
             tool_calls = []
+            reasoning_content = None
 
-        return OpenRouterCallResult(content=content, tool_calls=tool_calls, raw=response)
+        return OpenRouterCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            raw=response,
+            reasoning_content=reasoning_content,
+        )

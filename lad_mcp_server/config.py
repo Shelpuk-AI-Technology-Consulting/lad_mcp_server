@@ -81,6 +81,7 @@ class Settings:
     lad_serena_max_search_results: int
     zai_coding_plan_key: str | None = None
     kimi_code_api_key: str | None = None
+    intermittent_review_calls: int = 5
 
     @staticmethod
     def from_env() -> "Settings":
@@ -134,6 +135,10 @@ class Settings:
         if max_input_chars <= 0:
             raise ValueError("OPENROUTER_MAX_INPUT_CHARS must be > 0")
 
+        intermittent_review_calls = _get_int("INTERMITTENT_REVIEW_CALLS", 5)
+        if intermittent_review_calls < 0:
+            raise ValueError("INTERMITTENT_REVIEW_CALLS must be >= 0")
+
         return Settings(
             openrouter_api_key=api_key,
             openrouter_primary_reviewer_model=_get_str(
@@ -162,4 +167,5 @@ class Settings:
             lad_serena_max_search_results=_get_int("LAD_SERENA_MAX_SEARCH_RESULTS", 20),
             zai_coding_plan_key=_get_str("ZAI_CODING_PLAN_KEY"),
             kimi_code_api_key=_get_str("KIMI_CODE_API_KEY"),
+            intermittent_review_calls=intermittent_review_calls,
         )

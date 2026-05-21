@@ -436,6 +436,7 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 - `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `360`, per tool call; must be >= reviewer timeout)
 - `OPENROUTER_HTTP_REFERER` (optional; forwarded to OpenRouter)
 - `OPENROUTER_X_TITLE` (optional; forwarded to OpenRouter)
+- `INTERMITTENT_REVIEW_CALLS` (default: `5`). When `> 0`, Lad dispatches a parallel, non-blocking LLM side-call to the same model every N tool calls during a reviewer's Serena-exploration loop. The side-call asks for a partial review based on the conversation gathered so far. The most recent successful snapshot is cached. **If the reviewer wall-clock timeout fires before the model finalizes, Lad returns the cached snapshot (marked as intermittent) instead of the previous "Reviewer Error" stub** — preserving the value of all the tool-calling work already done. Set to `0` to disable.
 
 ### Budgeting / limits
 

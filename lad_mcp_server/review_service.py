@@ -20,6 +20,7 @@ from lad_mcp_server.openrouter_client import OpenRouterCallResult, OpenRouterCli
 from lad_mcp_server.path_utils import is_dangerous_repo_root
 from lad_mcp_server.prompts import (
     force_finalize_system_message,
+    intermittent_review_finalize_user_message,
     system_prompt_code_review,
     system_prompt_system_design_review,
     user_prompt_code_review,
@@ -41,6 +42,7 @@ TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
 KIMI_FALLBACK_TTL_SECONDS = 600
 KIMI_FALLBACK_CACHE_MAX_MODELS = 128
+INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 60
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -73,10 +75,15 @@ def _build_assistant_tool_calls_message(
     tool_calls: list[dict[str, Any]],
     *,
     content: str | None = None,
+    reasoning_content: str | None = None,
 ) -> dict[str, Any]:
     msg: dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
     if content:
         msg["content"] = content
+    # `reasoning_content` is required by Z.AI Coding Plan's Preserved Thinking contract.
+    # Non-Z.AI clients strip the key before sending (see openrouter_client.strip_reasoning_content).
+    if reasoning_content:
+        msg["reasoning_content"] = reasoning_content
     return msg
 
 
@@ -183,6 +190,26 @@ class ReviewerOutcome:
     error: str | None
     provider: str = "openrouter"
     provider_note: str | None = None
+    is_intermittent: bool = False
+
+
+class IntermittentReviewState:
+    """
+    Per-reviewer holder for the latest intermittent (partial) review snapshot.
+
+    Concurrency invariant: this holder is mutated ONLY from inside the side coroutine
+    `_run_intermittent_review_call`, which runs in the same event loop as the main
+    `_tool_loop`. The timeout handler in `_run_single_reviewer` reads the holder from
+    the same event loop. Single-threaded access — no lock required.
+    """
+
+    __slots__ = ("latest_markdown", "snapshot_tool_call_index", "tool_calls_so_far", "in_flight_task")
+
+    def __init__(self) -> None:
+        self.latest_markdown: str | None = None
+        self.snapshot_tool_call_index: int = 0
+        self.tool_calls_so_far: int = 0
+        self.in_flight_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +487,122 @@ class ReviewService:
             extra_body=extra_body,
         )
 
+    async def _run_intermittent_review_call(
+        self,
+        *,
+        model: str,
+        messages_snapshot: list[dict[str, Any]],
+        use_zai_direct: bool,
+        direct_model_name: str | None,
+        use_kimi_direct: bool,
+        direct_kimi_model_name: str | None,
+        extra_body: dict[str, Any] | None,
+        max_output_tokens: int,
+        snapshot_tool_call_index: int,
+        state: IntermittentReviewState,
+    ) -> None:
+        """
+        Fire a side LLM call (no tools) to produce a partial review snapshot.
+
+        Real errors (timeout, OpenRouter errors, whitespace-only responses) are swallowed.
+        `asyncio.CancelledError` is re-raised so cancellation propagates correctly; we use
+        `except Exception` for the catch-all to avoid swallowing `SystemExit`/`KeyboardInterrupt`.
+        Concurrency invariant: this coroutine is the ONLY writer of `state.latest_markdown`
+        and `state.snapshot_tool_call_index`. Reads happen from the same event loop.
+        """
+        # Fresh per-call provider trackers so the side call doesn't mutate the main reviewer's.
+        side_provider_used: list[str] = ["openrouter"]
+        side_provider_notes: list[str] = []
+        try:
+            result = await asyncio.wait_for(
+                self._call_model_with_provider_fallback(
+                    model=model,
+                    direct_model_name=direct_model_name,
+                    use_zai_direct=use_zai_direct,
+                    direct_kimi_model_name=direct_kimi_model_name,
+                    use_kimi_direct=use_kimi_direct,
+                    messages=messages_snapshot,
+                    timeout_seconds=INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+                    max_output_tokens=max_output_tokens,
+                    tools=None,
+                    preferred_tool_choice=None,
+                    extra_body=extra_body,
+                    provider_used=side_provider_used,
+                    provider_notes=side_provider_notes,
+                ),
+                timeout=INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info("Intermittent review side call failed for model '%s': %s", model, exc)
+            return
+
+        content = (result.content or "").strip()
+        if not content:
+            log.info("Intermittent review side call for model '%s' returned empty/whitespace content", model)
+            return
+        # Single-threaded event loop = atomic update without lock.
+        state.latest_markdown = result.content
+        state.snapshot_tool_call_index = snapshot_tool_call_index
+        # Drop the reference to the completed task so the messages snapshot can be GC'd.
+        # (Done-before-cancel guard in _dispatch_intermittent_review tolerates None.)
+        if state.in_flight_task is not None and state.in_flight_task.done():
+            state.in_flight_task = None
+
+    def _cancel_in_flight_intermittent(self, state: IntermittentReviewState | None) -> None:
+        """Best-effort cancellation of any pending intermittent side task. Safe to call on None / done."""
+        if state is None:
+            return
+        task = state.in_flight_task
+        if task is None or task.done():
+            return
+        task.cancel()
+
+    def _dispatch_intermittent_review(
+        self,
+        *,
+        state: IntermittentReviewState,
+        model: str,
+        messages: list[dict[str, Any]],
+        use_zai_direct: bool,
+        direct_model_name: str | None,
+        use_kimi_direct: bool,
+        direct_kimi_model_name: str | None,
+        extra_body: dict[str, Any] | None,
+        max_output_tokens: int,
+    ) -> None:
+        """
+        Schedule a non-blocking side LLM call to produce a partial review snapshot.
+
+        If a prior task is still in flight, it is cancelled first (a fresher snapshot is more
+        valuable). If the prior task is already done, it is left alone (its result has already
+        been recorded into `state` by its own completion).
+        """
+        prev = state.in_flight_task
+        if prev is not None and not prev.done():
+            prev.cancel()
+        # else: prev is None or already finished; its result (if successful) is already in state.
+
+        snapshot_messages: list[dict[str, Any]] = list(messages)
+        snapshot_messages.append(_build_user_message(intermittent_review_finalize_user_message()))
+
+        task = asyncio.create_task(
+            self._run_intermittent_review_call(
+                model=model,
+                messages_snapshot=snapshot_messages,
+                use_zai_direct=use_zai_direct,
+                direct_model_name=direct_model_name,
+                use_kimi_direct=use_kimi_direct,
+                direct_kimi_model_name=direct_kimi_model_name,
+                extra_body=extra_body,
+                max_output_tokens=max_output_tokens,
+                snapshot_tool_call_index=state.tool_calls_so_far,
+                state=state,
+            )
+        )
+        state.in_flight_task = task
+
     @staticmethod
     def _walk_up_for_project_root(start: Path, *, max_depth: int = 25) -> Path:
         """
@@ -665,6 +808,13 @@ class ReviewService:
 
     def _append_disclosure(self, outcome: ReviewerOutcome) -> str:
         # Disclose additional resources used, without leaking secrets.
+        body = outcome.markdown.rstrip()
+        if outcome.is_intermittent:
+            banner = (
+                "> ⚠ *Intermittent review — reviewer timed out before completing exploration. "
+                "This is a partial snapshot.*\n\n"
+            )
+            body = banner + body
         lines = []
         lines.append("---")
         lines.append(f"*Model: `{outcome.model}`*")
@@ -688,7 +838,7 @@ class ReviewService:
             lines.append("*Serena tools used: no*")
         if outcome.serena_disabled_reason:
             lines.append(f"*Serena note: {outcome.serena_disabled_reason}*")
-        return outcome.markdown.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+        return body + "\n\n" + "\n".join(lines) + "\n"
 
     def _synthesize(self, primary: ReviewerOutcome, secondary: ReviewerOutcome | None) -> str:
         if secondary is None:
@@ -706,6 +856,10 @@ class ReviewService:
                 notes.append("Secondary reviewer used Serena-backed context.")
             elif secondary.serena_disabled_reason:
                 notes.append(f"Secondary reviewer Serena context disabled: {secondary.serena_disabled_reason}.")
+            if primary.is_intermittent:
+                notes.append("Primary review is intermittent (partial snapshot due to timeout) — weight findings accordingly.")
+            if secondary.is_intermittent:
+                notes.append("Secondary review is intermittent (partial snapshot due to timeout) — weight findings accordingly.")
             base = "Primary and Secondary reviews are provided. Where recommendations conflict, consider severity and evidence in each section."
             if notes:
                 return base + "\n\n" + "\n".join(f"- {n}" for n in notes)
@@ -814,11 +968,18 @@ class ReviewService:
         redacted_inputs: dict[str, str],
         requested_paths: list[str] | None,
         file_context_builder: FileContextBuilder,
+        intermittent_state_override: IntermittentReviewState | None = None,
     ) -> ReviewerOutcome:
         model = cfg.model
         budget = cfg.budget
         serena_ctx = cfg.serena_ctx
         serena_disabled_reason = cfg.serena_disabled_reason
+        if intermittent_state_override is not None:
+            intermittent_state = intermittent_state_override
+        elif self._settings.intermittent_review_calls > 0:
+            intermittent_state = IntermittentReviewState()
+        else:
+            intermittent_state = None
 
         system_prompt = build_system_prompt(tool_calling_enabled=serena_ctx is not None)
         user_prompt = build_user_prompt(serena_ctx is not None, redacted_inputs)
@@ -898,9 +1059,12 @@ class ReviewService:
                     direct_kimi_model_name=cfg.direct_kimi_model_name,
                     provider_used=provider_used,
                     provider_notes=provider_notes,
+                    intermittent_state=intermittent_state,
                 ),
                 timeout=self._settings.openrouter_reviewer_timeout_seconds,
             )
+            # Defensive: ensure no in-flight intermittent task outlives the reviewer.
+            self._cancel_in_flight_intermittent(intermittent_state)
             used_serena = serena_ctx is not None and (
                 serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths
             )
@@ -920,8 +1084,35 @@ class ReviewService:
             )
         except (TimeoutError, asyncio.TimeoutError):
             # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
-            msg = f"Reviewer timed out after {self._settings.openrouter_reviewer_timeout_seconds}s"
+            timeout_seconds = self._settings.openrouter_reviewer_timeout_seconds
+            self._cancel_in_flight_intermittent(intermittent_state)
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
+
+            # If we have a cached intermittent snapshot, return it instead of the error stub.
+            if intermittent_state is not None and intermittent_state.latest_markdown:
+                note = (
+                    f"Reviewer timed out after {timeout_seconds}s while still exploring "
+                    f"({intermittent_state.tool_calls_so_far} tool calls made); "
+                    f"returning intermittent snapshot captured at tool call "
+                    f"{intermittent_state.snapshot_tool_call_index}."
+                )
+                return ReviewerOutcome(
+                    ok=True,
+                    model=model,
+                    used_serena=used_serena,
+                    serena_disabled_reason=serena_disabled_reason,
+                    serena_activated_project=serena_ctx.activated_project if serena_ctx is not None else None,
+                    serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
+                    serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
+                    serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
+                    markdown=intermittent_state.latest_markdown,
+                    error=None,
+                    provider=provider_used[0],
+                    provider_note=note,
+                    is_intermittent=True,
+                )
+
+            msg = f"Reviewer timed out after {timeout_seconds}s"
             return ReviewerOutcome(
                 ok=False,
                 model=model,
@@ -937,6 +1128,7 @@ class ReviewService:
                 provider_note=provider_notes[0] if provider_notes else None,
             )
         except Exception as exc:
+            self._cancel_in_flight_intermittent(intermittent_state)
             msg = _exc_message(exc)
             return ReviewerOutcome(
                 ok=False,
@@ -972,11 +1164,13 @@ class ReviewService:
         direct_kimi_model_name: str | None = None,
         provider_used: list[str] | None = None,
         provider_notes: list[str] | None = None,
+        intermittent_state: IntermittentReviewState | None = None,
     ) -> str:
         if provider_used is None:
             provider_used = ["openrouter"]
         if provider_notes is None:
             provider_notes = []
+        intermittent_n = self._settings.intermittent_review_calls if intermittent_state is not None else 0
         remaining_tool_calls = max_tool_calls
         did_force_project_overview = False
         did_force_baseline_memories = False
@@ -1056,6 +1250,7 @@ class ReviewService:
                         )
                     )
                     continue
+                self._cancel_in_flight_intermittent(intermittent_state)
                 return _append_tooling_degradation_summary(
                     content,
                     degraded_outputs_count=degraded_outputs_count,
@@ -1072,6 +1267,7 @@ class ReviewService:
                         "Provide your final review in plain markdown without any tool calls."
                     ))
                     continue
+                self._cancel_in_flight_intermittent(intermittent_state)
                 return _append_tooling_degradation_summary(
                     result.content or "",
                     degraded_outputs_count=degraded_outputs_count,
@@ -1080,10 +1276,13 @@ class ReviewService:
 
             executable_tool_calls = result.tool_calls[: max(remaining_tool_calls, 0)]
             if executable_tool_calls:
+                # Use `getattr` so this code path tolerates duck-typed result objects from tests
+                # that predate the addition of `reasoning_content` to `OpenRouterCallResult`.
                 messages.append(
                     _build_assistant_tool_calls_message(
                         executable_tool_calls,
                         content=result.content,
+                        reasoning_content=getattr(result, "reasoning_content", None),
                     )
                 )
 
@@ -1175,6 +1374,22 @@ class ReviewService:
                     messages.append(_build_system_message(force_finalize_system_message()))
                     tools = None
                     break
+
+                # Intermittent review dispatch (R2/R3): non-blocking; runs concurrent with main loop.
+                if intermittent_state is not None and intermittent_n > 0:
+                    intermittent_state.tool_calls_so_far += 1
+                    if intermittent_state.tool_calls_so_far % intermittent_n == 0:
+                        self._dispatch_intermittent_review(
+                            state=intermittent_state,
+                            model=model,
+                            messages=messages,
+                            use_zai_direct=use_zai_direct,
+                            direct_model_name=direct_model_name,
+                            use_kimi_direct=use_kimi_direct,
+                            direct_kimi_model_name=direct_kimi_model_name,
+                            extra_body=extra_body,
+                            max_output_tokens=max_output_tokens,
+                        )
 
 
 def _format_reviewer_error(model: str, error: str) -> str:
