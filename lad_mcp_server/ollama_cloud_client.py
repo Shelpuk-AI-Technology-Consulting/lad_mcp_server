@@ -13,7 +13,7 @@ from typing import Any
 from lad_mcp_server.openrouter_client import OpenRouterCallResult
 
 
-_OLLAMA_PREFIX_RE = re.compile(r"^ollama/", re.IGNORECASE)
+_OLLAMA_PREFIX_RE = re.compile(r"^(?:ollama_cloud|ollama)/", re.IGNORECASE)
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
 
 
@@ -34,11 +34,49 @@ def normalize_ollama_model_name(model: str) -> str:
     return normalized if normalized else model.strip()
 
 
-def translate_messages_to_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Translate OpenAI-style messages to Ollama native format.
+def _flatten_content(content: str | list | None) -> str:
+    """Flatten CC content (string or list of content blocks) to a plain string for Ollama."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
 
-    Key difference: tool result messages use `tool_name` instead of `name`/`tool_call_id`.
-    """
+
+def _cc_tool_calls_to_ollama(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert CC tool_calls (arguments as JSON string) to Ollama format (arguments as dict)."""
+    result: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        args = func.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        result.append({
+            "id": tc.get("id", ""),
+            "type": "function",
+            "function": {
+                "name": func.get("name", ""),
+                "arguments": args,
+            },
+        })
+    return result
+
+
+def translate_messages_to_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate OpenAI-style messages to Ollama native format."""
     result: list[dict[str, Any]] = []
     for msg in messages:
         role = msg.get("role")
@@ -46,21 +84,27 @@ def translate_messages_to_ollama(messages: list[dict[str, Any]]) -> list[dict[st
             result.append({
                 "role": "tool",
                 "tool_name": msg.get("name", ""),
-                "content": msg.get("content", ""),
+                "content": _flatten_content(msg.get("content", "")),
             })
         else:
             translated: dict[str, Any] = {"role": role}
             content = msg.get("content")
             if content is not None:
-                translated["content"] = content
+                translated["content"] = _flatten_content(content)
             if msg.get("tool_calls"):
-                translated["tool_calls"] = msg["tool_calls"]
+                translated["tool_calls"] = _cc_tool_calls_to_ollama(msg["tool_calls"])
+            if msg.get("thinking"):
+                translated["thinking"] = msg["thinking"]
             result.append(translated)
     return result
 
 
 def translate_ollama_response(parsed: dict[str, Any]) -> OpenRouterCallResult:
-    """Translate an Ollama /api/chat response into OpenRouterCallResult."""
+    """Translate an Ollama /api/chat response into OpenRouterCallResult.
+
+    Converts Ollama tool call arguments (dict) back to JSON strings for OpenAI/CC format.
+    Includes index field to disambiguate parallel tool calls.
+    """
     try:
         message = parsed.get("message", {})
         content = message.get("content") or None
@@ -68,13 +112,14 @@ def translate_ollama_response(parsed: dict[str, Any]) -> OpenRouterCallResult:
 
         tool_calls: list[dict[str, Any]] = []
         if raw_tool_calls:
-            for tc in raw_tool_calls:
+            for i, tc in enumerate(raw_tool_calls):
                 func = tc.get("function", {})
                 args = func.get("arguments", {})
                 if isinstance(args, dict):
                     args = json.dumps(args)
                 tool_calls.append({
-                    "id": tc.get("id", f"call_{id(tc):024x}"),
+                    "index": tc.get("function", {}).get("index", i),
+                    "id": tc.get("id", f"call_{i:024x}"),
                     "type": "function",
                     "function": {
                         "name": func.get("name", ""),
