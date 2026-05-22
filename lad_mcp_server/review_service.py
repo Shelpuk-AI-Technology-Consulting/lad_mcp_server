@@ -16,6 +16,7 @@ from lad_mcp_server.config import Settings
 from lad_mcp_server.file_context import FileContextBuilder
 from lad_mcp_server.markdown import final_egress_redaction, format_aggregated_output
 from lad_mcp_server.model_metadata import ModelMetadataError, OpenRouterModelsClient
+from lad_mcp_server.ollama_cloud_client import OllamaCloudClient, is_ollama_model, normalize_ollama_model_name
 from lad_mcp_server.openrouter_client import OpenRouterCallResult, OpenRouterClient, OpenRouterClientError
 from lad_mcp_server.path_utils import is_dangerous_repo_root
 from lad_mcp_server.prompts import (
@@ -259,13 +260,20 @@ class IntermittentReviewState:
     the same event loop. Single-threaded access — no lock required.
     """
 
-    __slots__ = ("latest_markdown", "snapshot_tool_call_index", "tool_calls_so_far", "in_flight_task")
+    __slots__ = (
+        "latest_markdown",
+        "snapshot_tool_call_index",
+        "tool_calls_so_far",
+        "in_flight_task",
+        "queued_snapshot",
+    )
 
     def __init__(self) -> None:
         self.latest_markdown: str | None = None
         self.snapshot_tool_call_index: int = 0
         self.tool_calls_so_far: int = 0
         self.in_flight_task: asyncio.Task[None] | None = None
+        self.queued_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,8 @@ class ReviewerConfig:
     direct_kimi_model_name: str | None = None
     use_deepseek_direct: bool = False
     direct_deepseek_model_name: str | None = None
+    use_ollama_direct: bool = False
+    direct_ollama_model_name: str | None = None
 
 
 class ReviewService:
@@ -296,6 +306,7 @@ class ReviewService:
         zai_client: ZaiCodingClient | Any | None = None,
         kimi_client: KimiCodeClient | Any | None = None,
         deepseek_client: DeepSeekClient | Any | None = None,
+        ollama_client: OllamaCloudClient | Any | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._openrouter = openrouter_client or OpenRouterClient(
@@ -324,6 +335,12 @@ class ReviewService:
         if self._deepseek is None and self._settings.deepseek_api_key:
             self._deepseek = DeepSeekClient(
                 api_key=self._settings.deepseek_api_key,
+                max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
+            )
+        self._ollama = ollama_client
+        if self._ollama is None and self._settings.ollama_api_key:
+            self._ollama = OllamaCloudClient(
+                api_key=self._settings.ollama_api_key,
                 max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
             )
         # NOTE: `repo_root` here is treated as a *default* only.
@@ -493,6 +510,8 @@ class ReviewService:
         use_kimi_direct: bool,
         direct_deepseek_model_name: str | None,
         use_deepseek_direct: bool,
+        direct_ollama_model_name: str | None = None,
+        use_ollama_direct: bool = False,
         messages: list[dict[str, Any]],
         timeout_seconds: int,
         max_output_tokens: int,
@@ -521,6 +540,26 @@ class ReviewService:
                     provider_notes.append(note)
                 provider_used[:] = ["openrouter"]
                 log.warning("Direct DeepSeek call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+
+        if use_ollama_direct and self._ollama is not None and direct_ollama_model_name:
+            try:
+                result = await self._ollama.chat_completion(
+                    model=direct_ollama_model_name,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    extra_body=extra_body,
+                )
+                provider_used[:] = ["ollama"]
+                return result
+            except Exception as exc:
+                note = f"Ollama Cloud endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                if not provider_notes:
+                    provider_notes.append(note)
+                provider_used[:] = ["openrouter"]
+                log.warning("Direct Ollama call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
         if use_zai_direct and self._zai is not None and direct_model_name:
             try:
@@ -586,6 +625,8 @@ class ReviewService:
         direct_kimi_model_name: str | None,
         use_deepseek_direct: bool = False,
         direct_deepseek_model_name: str | None = None,
+        use_ollama_direct: bool = False,
+        direct_ollama_model_name: str | None = None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
         snapshot_tool_call_index: int,
@@ -613,6 +654,8 @@ class ReviewService:
                     use_kimi_direct=use_kimi_direct,
                     direct_deepseek_model_name=direct_deepseek_model_name,
                     use_deepseek_direct=use_deepseek_direct,
+                    direct_ollama_model_name=direct_ollama_model_name,
+                    use_ollama_direct=use_ollama_direct,
                     messages=messages_snapshot,
                     timeout_seconds=self._intermittent_timeout,
                     max_output_tokens=max_output_tokens,
@@ -633,14 +676,19 @@ class ReviewService:
         content = (result.content or "").strip()
         if not content:
             log.info("Intermittent review side call for model '%s' returned empty/whitespace content", model)
-            return
-        # Single-threaded event loop = atomic update without lock.
-        state.latest_markdown = result.content
-        state.snapshot_tool_call_index = snapshot_tool_call_index
-        # Drop the reference to the completed task so the messages snapshot can be GC'd.
-        # (Done-before-cancel guard in _dispatch_intermittent_review tolerates None.)
+        else:
+            # Single-threaded event loop = atomic update without lock.
+            state.latest_markdown = result.content
+            state.snapshot_tool_call_index = snapshot_tool_call_index
+
+        # Drop the reference to the completed task so the messages snapshot can be GC'd,
+        # then start the latest queued snapshot request, if any.
         if state.in_flight_task is not None and state.in_flight_task.done():
             state.in_flight_task = None
+        queued = state.queued_snapshot
+        state.queued_snapshot = None
+        if queued is not None:
+            state.in_flight_task = asyncio.create_task(self._run_intermittent_review_call(**queued))
 
     def _cancel_in_flight_intermittent(self, state: IntermittentReviewState | None) -> None:
         """Best-effort cancellation of any pending intermittent side task. Safe to call on None / done."""
@@ -663,24 +711,43 @@ class ReviewService:
         direct_kimi_model_name: str | None,
         use_deepseek_direct: bool,
         direct_deepseek_model_name: str | None,
+        use_ollama_direct: bool,
+        direct_ollama_model_name: str | None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
     ) -> None:
         """
         Schedule a non-blocking side LLM call to produce a partial review snapshot.
 
-        If a prior task is still in flight, it is cancelled first (a fresher snapshot is more
-        valuable). If the prior task is already done, it is left alone (its result has already
-        been recorded into `state` by its own completion).
+        If a prior task is still in flight, keep it running and remember the latest
+        requested snapshot. The running task will dispatch the queued snapshot after it completes.
         """
-        prev = state.in_flight_task
-        if prev is not None and not prev.done():
-            prev.cancel()
-        # else: prev is None or already finished; its result (if successful) is already in state.
-
         snapshot_messages: list[dict[str, Any]] = list(messages)
         snapshot_messages.append(_build_user_message(intermittent_review_finalize_user_message()))
 
+        request = {
+            "model": model,
+            "messages_snapshot": snapshot_messages,
+            "use_zai_direct": use_zai_direct,
+            "direct_model_name": direct_model_name,
+            "use_kimi_direct": use_kimi_direct,
+            "direct_kimi_model_name": direct_kimi_model_name,
+            "use_deepseek_direct": use_deepseek_direct,
+            "direct_deepseek_model_name": direct_deepseek_model_name,
+            "use_ollama_direct": use_ollama_direct,
+            "direct_ollama_model_name": direct_ollama_model_name,
+            "extra_body": extra_body,
+            "max_output_tokens": max_output_tokens,
+            "snapshot_tool_call_index": state.tool_calls_so_far,
+            "state": state,
+        }
+
+        prev = state.in_flight_task
+        if prev is not None and not prev.done():
+            state.queued_snapshot = request
+            return
+
+        state.queued_snapshot = None
         task = asyncio.create_task(
             self._run_intermittent_review_call(
                 model=model,
@@ -691,6 +758,8 @@ class ReviewService:
                 direct_kimi_model_name=direct_kimi_model_name,
                 use_deepseek_direct=use_deepseek_direct,
                 direct_deepseek_model_name=direct_deepseek_model_name,
+                use_ollama_direct=use_ollama_direct,
+                direct_ollama_model_name=direct_ollama_model_name,
                 extra_body=extra_body,
                 max_output_tokens=max_output_tokens,
                 snapshot_tool_call_index=state.tool_calls_so_far,
@@ -988,7 +1057,14 @@ class ReviewService:
         )
         direct_deepseek_model_name = normalize_deepseek_model_name(model) if use_deepseek_direct else None
 
-        if use_zai_direct or use_kimi_direct or use_deepseek_direct:
+        use_ollama_direct = (
+            bool(self._settings.ollama_api_key)
+            and self._ollama is not None
+            and is_ollama_model(model)
+        )
+        direct_ollama_model_name = normalize_ollama_model_name(model) if use_ollama_direct else None
+
+        if use_zai_direct or use_kimi_direct or use_deepseek_direct or use_ollama_direct:
             input_budget_tokens = max(self._settings.openrouter_max_input_chars // CHARS_PER_TOKEN_ESTIMATE, 1)
             budget = TokenBudget(
                 effective_context_length=(
@@ -1061,6 +1137,8 @@ class ReviewService:
             direct_kimi_model_name=direct_kimi_model_name,
             use_deepseek_direct=use_deepseek_direct,
             direct_deepseek_model_name=direct_deepseek_model_name,
+            use_ollama_direct=use_ollama_direct,
+            direct_ollama_model_name=direct_ollama_model_name,
         )
 
     async def _run_single_reviewer(
@@ -1164,6 +1242,8 @@ class ReviewService:
                     direct_kimi_model_name=cfg.direct_kimi_model_name,
                     use_deepseek_direct=cfg.use_deepseek_direct,
                     direct_deepseek_model_name=cfg.direct_deepseek_model_name,
+                    use_ollama_direct=cfg.use_ollama_direct,
+                    direct_ollama_model_name=cfg.direct_ollama_model_name,
                     provider_used=provider_used,
                     provider_notes=provider_notes,
                     intermittent_state=intermittent_state,
@@ -1192,6 +1272,19 @@ class ReviewService:
         except (TimeoutError, asyncio.TimeoutError):
             # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
             timeout_seconds = self._settings.openrouter_reviewer_timeout_seconds
+            # Give an in-flight intermittent side-call a short grace period to finish.
+            # Reasoning models can spend most of the side-call budget on thinking tokens,
+            # so a brief wait (proportional to the intermittent timeout) is the best chance
+            # to get a substantive snapshot. Only cancel after the grace period.
+            grace_seconds = max(5, min(30, self._intermittent_timeout // 4))
+            if intermittent_state is not None and intermittent_state.in_flight_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        intermittent_state.in_flight_task,
+                        timeout=grace_seconds,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
             self._cancel_in_flight_intermittent(intermittent_state)
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
 
@@ -1318,6 +1411,8 @@ class ReviewService:
         direct_kimi_model_name: str | None = None,
         use_deepseek_direct: bool = False,
         direct_deepseek_model_name: str | None = None,
+        use_ollama_direct: bool = False,
+        direct_ollama_model_name: str | None = None,
         provider_used: list[str] | None = None,
         provider_notes: list[str] | None = None,
         intermittent_state: IntermittentReviewState | None = None,
@@ -1382,6 +1477,8 @@ class ReviewService:
                 use_kimi_direct=use_kimi_direct,
                 direct_deepseek_model_name=direct_deepseek_model_name,
                 use_deepseek_direct=use_deepseek_direct,
+                direct_ollama_model_name=direct_ollama_model_name,
+                use_ollama_direct=use_ollama_direct,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
@@ -1547,6 +1644,8 @@ class ReviewService:
                             direct_kimi_model_name=direct_kimi_model_name,
                             use_deepseek_direct=use_deepseek_direct,
                             direct_deepseek_model_name=direct_deepseek_model_name,
+                            use_ollama_direct=use_ollama_direct,
+                            direct_ollama_model_name=direct_ollama_model_name,
                             extra_body=extra_body,
                             max_output_tokens=max_output_tokens,
                         )

@@ -186,6 +186,13 @@ uvx --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_serve
 
 First-run note: the first `uvx` invocation may take 30–60 seconds while it builds the tool environment. If your MCP client times out on first start, run the command once in a terminal to “prewarm” it, then retry in your client.
 
+Tip: add `--refresh` before `--from` to force uvx to re-resolve the latest commit from GitHub on every launch. This ensures you get the newest version without clearing the cache manually:
+
+```bash
+uvx --refresh --from git+https://github.com/Shelpuk-AI-Technology-Consulting/lad_mcp_server \
+  lad-mcp-server
+```
+
 ## Install & run (local development)
 
 Lad ships a stdio CLI entrypoint: `lad-mcp-server`.
@@ -427,7 +434,32 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 - `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2.5`)
 - `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `minimax/minimax-m2.7`)
   - Set to `0` to disable the Secondary reviewer (Primary-only mode).
-  - Set to `kimi-for-coding` (or any `moonshotai/` model) to bypass OpenRouter entirely and route directly to the Kimi Code endpoint when `KIMI_CODE_API_KEY` is configured.
+
+### Direct provider endpoints
+
+Lad can route reviewer calls directly to provider endpoints, bypassing OpenRouter for lower latency and cost. When a direct call fails, Lad automatically falls back to OpenRouter.
+
+| Model prefix | Endpoint | Env variable | Notes |
+|---|---|---|---|
+| `z-ai/` or `zai/` | Z.AI Coding Plan | `ZAI_CODING_PLAN_KEY` | Supports Preserved Thinking (reasoning models like GLM-5). Model prefix is stripped: `z-ai/glm-5` → `glm-5`. |
+| `deepseek/` | DeepSeek API | `DEEPSEEK_API_KEY` | Thinking mode enabled automatically. Model prefix is stripped: `deepseek/deepseek-v4-pro` → `deepseek-v4-pro`. Reasoning content is preserved across tool-call rounds. |
+| `moonshotai/` or `kimi-for-coding` | Kimi Code | `KIMI_CODE_API_KEY` | Routes to Kimi Code endpoint. All models normalize to `kimi-for-coding`. |
+
+Example configuration for Z.AI GLM-5.1 as primary, DeepSeek as secondary:
+
+```json
+{
+  "lad": {
+    "env": {
+      "OPENROUTER_API_KEY": "...",
+      "ZAI_CODING_PLAN_KEY": "...",
+      "DEEPSEEK_API_KEY": "...",
+      "OPENROUTER_PRIMARY_REVIEWER_MODEL": "z-ai/glm-5.1",
+      "OPENROUTER_SECONDARY_REVIEWER_MODEL": "deepseek/deepseek-v4-pro"
+    }
+  }
+}
+```
 
 ### OpenRouter request behavior
 
@@ -436,7 +468,13 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 - `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `360`, per tool call; must be >= reviewer timeout)
 - `OPENROUTER_HTTP_REFERER` (optional; forwarded to OpenRouter)
 - `OPENROUTER_X_TITLE` (optional; forwarded to OpenRouter)
-- `INTERMITTENT_REVIEW_CALLS` (default: `5`). When `> 0`, Lad dispatches a parallel, non-blocking LLM side-call to the same model every N tool calls during a reviewer's Serena-exploration loop. The side-call asks for a partial review based on the conversation gathered so far. The most recent successful snapshot is cached. **If the reviewer wall-clock timeout fires before the model finalizes, Lad returns the cached snapshot (marked as intermittent) instead of the previous "Reviewer Error" stub** — preserving the value of all the tool-calling work already done. Set to `0` to disable.
+- `INTERMITTENT_REVIEW_CALLS` (default: `5`). When `> 0`, Lad dispatches a parallel, non-blocking LLM side-call to the same model every N tool calls during a reviewer's Serena-exploration loop. The side-call asks for a partial review based on the conversation gathered so far. The most recent successful snapshot is cached. **If the reviewer wall-clock timeout fires before the model finalizes, Lad returns the cached snapshot (marked as intermittent)**. If no model-generated snapshot is available, Lad synthesizes a **tool-exploration trace summary** from the Serena tool call history (files read, memories accessed, tools invoked) — so you always get useful information, even when the model never completes its review. Set to `0` to disable.
+
+### Direct provider API keys (optional – bypass OpenRouter)
+
+- `ZAI_CODING_PLAN_KEY` (optional). When set, models with `z-ai/` prefix route directly to the Z.AI Coding Plan endpoint.
+- `KIMI_CODE_API_KEY` (optional). When set, models with `moonshotai/` prefix or `kimi-for-coding` route directly to the Kimi Code endpoint.
+- `DEEPSEEK_API_KEY` (optional). When set, models with `deepseek/` prefix route directly to the DeepSeek API with thinking mode enabled.
 
 ### Budgeting / limits
 
@@ -620,6 +658,9 @@ We also recommend that you prioritize OpenRouter providers by throughput:
 - First run is slow / client times out: run the `uvx` command from Quickstart once in a terminal to prewarm, then restart the client.
 - “OPENROUTER_API_KEY is required”: ensure the MCP client process has access to the variable (or paste it into the client config).
 - Secondary reviewer is too expensive/slow: set `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`.
+- Reviewer returns “Reviewer Error” on timeout: ensure your MCP client's tool execution timeout exceeds Lad's `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS`. For Claude Code, set `MCP_TOOL_TIMEOUT` (in the Lad `env` block or globally) to at least 2× your reviewer timeout.
+- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be >= OPENROUTER_REVIEWER_TIMEOUT_SECONDS`: Lad validates that the tool-call timeout is at least as large as the reviewer timeout. Increase `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` or decrease `OPENROUTER_REVIEWER_TIMEOUT_SECONDS`.
+- Stale package after updating: add `--refresh` to the `uvx` args in your MCP config, then fully restart your MCP client (not just reconnect).
 
 ## Security notes
 
