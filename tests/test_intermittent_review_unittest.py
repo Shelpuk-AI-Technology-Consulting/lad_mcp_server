@@ -750,8 +750,8 @@ class TestDisclosureAndSynthesis(unittest.TestCase):
 
 
 class TestConstants(unittest.TestCase):
-    def test_intermittent_review_timeout_seconds_is_60(self) -> None:
-        self.assertEqual(INTERMITTENT_REVIEW_TIMEOUT_SECONDS, 60)
+    def test_intermittent_review_timeout_seconds_is_120(self) -> None:
+        self.assertEqual(INTERMITTENT_REVIEW_TIMEOUT_SECONDS, 120)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.schemas import CodeReviewRequest, SystemDesignReviewRequest, ValidationError
 from lad_mcp_server.serena_bridge import BASELINE_REQUIRED_MEMORIES, SerenaContext, SerenaLimits, SerenaToolError
 from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
+from lad_mcp_server.deepseek_client import DeepSeekClient, is_deepseek_model, normalize_deepseek_model_name
 from lad_mcp_server.kimi_code_client import KimiCodeClient, is_kimi_model, normalize_kimi_model_name
 from lad_mcp_server.zai_coding_client import ZaiCodingClient, is_zai_model, normalize_zai_model_name
 
@@ -42,7 +43,7 @@ TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
 KIMI_FALLBACK_TTL_SECONDS = 600
 KIMI_FALLBACK_CACHE_MAX_MODELS = 128
-INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 60
+INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 120
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -176,6 +177,61 @@ def _skipped_preflight_warning_message(missing_required: set[str]) -> str:
     )
 
 
+def _is_substantive_review_content(content: str) -> bool:
+    """Check whether review content has at least one substantive line beyond placeholders."""
+    if not content or not content.strip():
+        return False
+    placeholder_re = __import__("re").compile(
+        r"^\*\([^)]+\)\*$|"  # *(No Summary provided by reviewer)*
+        r"^#{1,4}\s+.+$",     # markdown section headers
+        __import__("re").MULTILINE,
+    )
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if placeholder_re.match(stripped):
+            continue
+        # At least one line with 3+ words that isn't a placeholder
+        words = stripped.split()
+        if len(words) >= 3:
+            return True
+    return False
+
+
+def _build_tool_trace_summary(
+    *,
+    model: str,
+    timeout_seconds: int,
+    tool_calls_made: int,
+    tools_invoked: set[str],
+    memories_used: set[str],
+    paths_used: set[str],
+) -> str:
+    """Synthesize a structured markdown summary from the Serena tool call trace."""
+    tools_list = ", ".join(sorted(tools_invoked)) if tools_invoked else "(none)"
+    memories_list = ", ".join(sorted(memories_used)) if memories_used else "(none)"
+    paths_list = ", ".join(f"`{p}`" for p in sorted(paths_used)) if paths_used else "(none)"
+
+    return (
+        "## Summary\n"
+        f"Reviewer (`{model}`) timed out after {timeout_seconds}s during tool-assisted exploration.\n"
+        "This is a **tool-exploration trace summary**, not a model-generated review.\n\n"
+        "## Exploration Statistics\n"
+        f"- **Tool calls made**: {tool_calls_made}\n"
+        f"- **Tools invoked**: {tools_list}\n"
+        f"- **Memories accessed**: {memories_list}\n"
+        f"- **Files explored**: {len(paths_used)}\n\n"
+        "## Files Explored\n"
+        f"{paths_list}\n\n"
+        "## Tools Used\n"
+        f"{tools_list}\n\n"
+        "## Recommendations\n"
+        "- Re-run the review with a longer timeout to get a full model-generated review.\n"
+        "- Consider reducing the scope (fewer files) to fit within the timeout budget.\n"
+    )
+
+
 @dataclass(frozen=True)
 class ReviewerOutcome:
     ok: bool
@@ -225,6 +281,8 @@ class ReviewerConfig:
     direct_model_name: str | None = None
     use_kimi_direct: bool = False
     direct_kimi_model_name: str | None = None
+    use_deepseek_direct: bool = False
+    direct_deepseek_model_name: str | None = None
 
 
 class ReviewService:
@@ -237,6 +295,7 @@ class ReviewService:
         models_client: OpenRouterModelsClient | None = None,
         zai_client: ZaiCodingClient | Any | None = None,
         kimi_client: KimiCodeClient | Any | None = None,
+        deepseek_client: DeepSeekClient | Any | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._openrouter = openrouter_client or OpenRouterClient(
@@ -261,11 +320,18 @@ class ReviewService:
                 api_key=self._settings.kimi_code_api_key,
                 max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
             )
+        self._deepseek = deepseek_client
+        if self._deepseek is None and self._settings.deepseek_api_key:
+            self._deepseek = DeepSeekClient(
+                api_key=self._settings.deepseek_api_key,
+                max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
+            )
         # NOTE: `repo_root` here is treated as a *default* only.
         # The reviewed project is inferred per tool invocation (prefer CODEX_WORKSPACE_ROOT; otherwise absolute-path
         # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
         self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
+        self._intermittent_timeout = max(120, self._settings.openrouter_reviewer_timeout_seconds // 2)
         self._tool_choice_fallback_until_by_model: dict[str, float] = {}
         self._tool_choice_fallback_lock = threading.Lock()
         self._kimi_fallback_until_by_model: dict[str, float] = {}
@@ -425,6 +491,8 @@ class ReviewService:
         use_zai_direct: bool,
         direct_kimi_model_name: str | None,
         use_kimi_direct: bool,
+        direct_deepseek_model_name: str | None,
+        use_deepseek_direct: bool,
         messages: list[dict[str, Any]],
         timeout_seconds: int,
         max_output_tokens: int,
@@ -434,6 +502,26 @@ class ReviewService:
         provider_used: list[str],
         provider_notes: list[str],
     ) -> OpenRouterCallResult:
+        if use_deepseek_direct and self._deepseek is not None and direct_deepseek_model_name:
+            try:
+                result = await self._deepseek.chat_completion(
+                    model=direct_deepseek_model_name,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    extra_body=extra_body,
+                )
+                provider_used[:] = ["deepseek"]
+                return result
+            except Exception as exc:
+                note = f"DeepSeek endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                if not provider_notes:
+                    provider_notes.append(note)
+                provider_used[:] = ["openrouter"]
+                log.warning("Direct DeepSeek call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+
         if use_zai_direct and self._zai is not None and direct_model_name:
             try:
                 result = await self._zai.chat_completion(
@@ -496,6 +584,8 @@ class ReviewService:
         direct_model_name: str | None,
         use_kimi_direct: bool,
         direct_kimi_model_name: str | None,
+        use_deepseek_direct: bool = False,
+        direct_deepseek_model_name: str | None = None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
         snapshot_tool_call_index: int,
@@ -521,8 +611,10 @@ class ReviewService:
                     use_zai_direct=use_zai_direct,
                     direct_kimi_model_name=direct_kimi_model_name,
                     use_kimi_direct=use_kimi_direct,
+                    direct_deepseek_model_name=direct_deepseek_model_name,
+                    use_deepseek_direct=use_deepseek_direct,
                     messages=messages_snapshot,
-                    timeout_seconds=INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+                    timeout_seconds=self._intermittent_timeout,
                     max_output_tokens=max_output_tokens,
                     tools=None,
                     preferred_tool_choice=None,
@@ -530,7 +622,7 @@ class ReviewService:
                     provider_used=side_provider_used,
                     provider_notes=side_provider_notes,
                 ),
-                timeout=INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+                timeout=self._intermittent_timeout,
             )
         except asyncio.CancelledError:
             raise
@@ -569,6 +661,8 @@ class ReviewService:
         direct_model_name: str | None,
         use_kimi_direct: bool,
         direct_kimi_model_name: str | None,
+        use_deepseek_direct: bool,
+        direct_deepseek_model_name: str | None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
     ) -> None:
@@ -595,6 +689,8 @@ class ReviewService:
                 direct_model_name=direct_model_name,
                 use_kimi_direct=use_kimi_direct,
                 direct_kimi_model_name=direct_kimi_model_name,
+                use_deepseek_direct=use_deepseek_direct,
+                direct_deepseek_model_name=direct_deepseek_model_name,
                 extra_body=extra_body,
                 max_output_tokens=max_output_tokens,
                 snapshot_tool_call_index=state.tool_calls_so_far,
@@ -885,7 +981,14 @@ class ReviewService:
         )
         direct_kimi_model_name = normalize_kimi_model_name(model) if use_kimi_direct else None
 
-        if use_zai_direct or use_kimi_direct:
+        use_deepseek_direct = (
+            bool(self._settings.deepseek_api_key)
+            and self._deepseek is not None
+            and is_deepseek_model(model)
+        )
+        direct_deepseek_model_name = normalize_deepseek_model_name(model) if use_deepseek_direct else None
+
+        if use_zai_direct or use_kimi_direct or use_deepseek_direct:
             input_budget_tokens = max(self._settings.openrouter_max_input_chars // CHARS_PER_TOKEN_ESTIMATE, 1)
             budget = TokenBudget(
                 effective_context_length=(
@@ -956,6 +1059,8 @@ class ReviewService:
             direct_model_name=direct_model_name,
             use_kimi_direct=use_kimi_direct,
             direct_kimi_model_name=direct_kimi_model_name,
+            use_deepseek_direct=use_deepseek_direct,
+            direct_deepseek_model_name=direct_deepseek_model_name,
         )
 
     async def _run_single_reviewer(
@@ -1057,6 +1162,8 @@ class ReviewService:
                     direct_model_name=cfg.direct_model_name,
                     use_kimi_direct=cfg.use_kimi_direct,
                     direct_kimi_model_name=cfg.direct_kimi_model_name,
+                    use_deepseek_direct=cfg.use_deepseek_direct,
+                    direct_deepseek_model_name=cfg.direct_deepseek_model_name,
                     provider_used=provider_used,
                     provider_notes=provider_notes,
                     intermittent_state=intermittent_state,
@@ -1089,13 +1196,30 @@ class ReviewService:
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
 
             # If we have a cached intermittent snapshot, return it instead of the error stub.
+            # Try intermittent snapshot first — return if substantive.
             if intermittent_state is not None and intermittent_state.latest_markdown:
+                snapshot = intermittent_state.latest_markdown
+                snapshot_is_substantive = _is_substantive_review_content(snapshot)
                 note = (
                     f"Reviewer timed out after {timeout_seconds}s while still exploring "
                     f"({intermittent_state.tool_calls_so_far} tool calls made); "
                     f"returning intermittent snapshot captured at tool call "
                     f"{intermittent_state.snapshot_tool_call_index}."
                 )
+                if not snapshot_is_substantive:
+                    note += " Snapshot contains placeholder-only content; see tool-exploration trace below."
+                # Build tool-trace fallback to append if snapshot is not substantive.
+                markdown = snapshot
+                if not snapshot_is_substantive and serena_ctx is not None:
+                    trace = _build_tool_trace_summary(
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        tool_calls_made=intermittent_state.tool_calls_so_far,
+                        tools_invoked=serena_ctx.used_tools,
+                        memories_used=serena_ctx.used_memories,
+                        paths_used=serena_ctx.used_paths,
+                    )
+                    markdown = snapshot.rstrip() + "\n\n---\n\n" + trace
                 return ReviewerOutcome(
                     ok=True,
                     model=model,
@@ -1105,7 +1229,37 @@ class ReviewService:
                     serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
                     serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
                     serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
-                    markdown=intermittent_state.latest_markdown,
+                    markdown=markdown,
+                    error=None,
+                    provider=provider_used[0],
+                    provider_note=note,
+                    is_intermittent=True,
+                )
+
+            # No snapshot — synthesize tool-trace fallback if Serena was active.
+            if serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_paths):
+                trace = _build_tool_trace_summary(
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    tool_calls_made=intermittent_state.tool_calls_so_far if intermittent_state else 0,
+                    tools_invoked=serena_ctx.used_tools,
+                    memories_used=serena_ctx.used_memories,
+                    paths_used=serena_ctx.used_paths,
+                )
+                note = (
+                    f"Reviewer timed out after {timeout_seconds}s with no model-generated review. "
+                    "Returning tool-exploration trace summary as fallback."
+                )
+                return ReviewerOutcome(
+                    ok=True,
+                    model=model,
+                    used_serena=used_serena,
+                    serena_disabled_reason=serena_disabled_reason,
+                    serena_activated_project=serena_ctx.activated_project,
+                    serena_used_tools=tuple(sorted(serena_ctx.used_tools)),
+                    serena_used_memories=tuple(sorted(serena_ctx.used_memories)),
+                    serena_used_paths=tuple(sorted(serena_ctx.used_paths)),
+                    markdown=trace,
                     error=None,
                     provider=provider_used[0],
                     provider_note=note,
@@ -1162,6 +1316,8 @@ class ReviewService:
         direct_model_name: str | None = None,
         use_kimi_direct: bool = False,
         direct_kimi_model_name: str | None = None,
+        use_deepseek_direct: bool = False,
+        direct_deepseek_model_name: str | None = None,
         provider_used: list[str] | None = None,
         provider_notes: list[str] | None = None,
         intermittent_state: IntermittentReviewState | None = None,
@@ -1224,6 +1380,8 @@ class ReviewService:
                 use_zai_direct=use_zai_direct,
                 direct_kimi_model_name=direct_kimi_model_name,
                 use_kimi_direct=use_kimi_direct,
+                direct_deepseek_model_name=direct_deepseek_model_name,
+                use_deepseek_direct=use_deepseek_direct,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
@@ -1387,6 +1545,8 @@ class ReviewService:
                             direct_model_name=direct_model_name,
                             use_kimi_direct=use_kimi_direct,
                             direct_kimi_model_name=direct_kimi_model_name,
+                            use_deepseek_direct=use_deepseek_direct,
+                            direct_deepseek_model_name=direct_deepseek_model_name,
                             extra_body=extra_body,
                             max_output_tokens=max_output_tokens,
                         )
