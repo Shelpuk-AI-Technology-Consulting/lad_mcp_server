@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import os
 import tempfile
 import unittest
@@ -10,12 +11,19 @@ from unittest import mock
 
 from lad_mcp_server.config import Settings
 from lad_mcp_server.model_metadata import ModelMetadata, ProviderLimits
-from lad_mcp_server.openrouter_client import OpenRouterClientError
+from lad_mcp_server.openrouter_client import OpenRouterCallResult, OpenRouterClientError
+from lad_mcp_server.token_budget import TokenBudget
 from lad_mcp_server.review_service import (
     INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+    EXPLORATION_DIGEST_MAX_SNIPPET_CHARS,
+    ExplorationDigest,
     IntermittentReviewState,
     ReviewerOutcome,
     ReviewService,
+    _build_tool_trace_summary,
+    _render_digest_snapshot,
+    _select_best_interim_markdown,
+    _update_exploration_digest,
 )
 
 
@@ -31,10 +39,33 @@ class TestSettingsIntermittentReviewCalls(unittest.TestCase):
             env.update(extra)
         return env
 
-    def test_settings_intermittent_review_calls_default_is_5(self) -> None:
+    def test_settings_intermittent_review_calls_default_is_2(self) -> None:
         with mock.patch.dict(os.environ, self._required_env(), clear=True):
             s = Settings.from_env()
-        self.assertEqual(s.intermittent_review_calls, 5)
+        self.assertEqual(s.intermittent_review_calls, 2)
+
+    def test_settings_intermittent_max_output_tokens_default_is_1500(self) -> None:
+        with mock.patch.dict(os.environ, self._required_env(), clear=True):
+            s = Settings.from_env()
+        self.assertEqual(s.intermittent_max_output_tokens, 1500)
+
+    def test_settings_intermittent_max_output_tokens_explicit_override(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            self._required_env({"INTERMITTENT_MAX_OUTPUT_TOKENS": "2000"}),
+            clear=True,
+        ):
+            s = Settings.from_env()
+        self.assertEqual(s.intermittent_max_output_tokens, 2000)
+
+    def test_settings_intermittent_max_output_tokens_zero_raises(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            self._required_env({"INTERMITTENT_MAX_OUTPUT_TOKENS": "0"}),
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                Settings.from_env()
 
     def test_settings_intermittent_review_calls_explicit_zero(self) -> None:
         with mock.patch.dict(
@@ -65,6 +96,351 @@ class TestSettingsIntermittentReviewCalls(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: ExplorationDigest
+# ---------------------------------------------------------------------------
+
+
+class TestExplorationDigest(unittest.TestCase):
+    def test_defaults_are_empty_collections_and_zero_counters(self) -> None:
+        digest = ExplorationDigest()
+        self.assertEqual(digest.files_read, [])
+        self.assertEqual(digest.symbols_found, [])
+        self.assertEqual(digest.search_matches, [])
+        self.assertEqual(digest.llm_findings, [])
+        self.assertEqual(digest.llm_recommendations, [])
+        self.assertEqual(digest.llm_open_questions, [])
+        self.assertEqual(digest.tools_invoked, set())
+        self.assertEqual(digest.memories_used, set())
+        self.assertEqual(digest.paths_visited, set())
+        self.assertEqual(digest.degraded_outputs, 0)
+        self.assertEqual(digest.total_tool_calls, 0)
+
+    def test_state_initializes_empty_digest(self) -> None:
+        state = IntermittentReviewState()
+        self.assertIsInstance(state.digest, ExplorationDigest)
+        self.assertEqual(state.digest.total_tool_calls, 0)
+        self.assertEqual(state.digest.files_read, [])
+
+    def test_update_records_read_file_path(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "read_file",
+            '{"path": "src/main.py"}',
+            '{"path": "src/main.py", "content": "secret file contents"}',
+            False,
+        )
+        self.assertEqual(digest.total_tool_calls, 1)
+        self.assertEqual(digest.tools_invoked, {"read_file"})
+        self.assertEqual(digest.files_read, ["src/main.py"])
+        self.assertEqual(digest.paths_visited, {"src/main.py"})
+        self.assertNotIn("secret file contents", repr(digest))
+
+    def test_update_records_read_memory_name(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "read_memory",
+            '{"name": "project_overview"}',
+            '{"name": "project_overview.md", "content": "memory contents"}',
+            False,
+        )
+        self.assertEqual(digest.memories_used, {"project_overview.md"})
+        self.assertNotIn("memory contents", repr(digest))
+
+    def test_update_records_degraded_result(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(digest, "read_file", "{}", '{"error": "boom"}', True)
+        self.assertEqual(digest.total_tool_calls, 1)
+        self.assertEqual(digest.degraded_outputs, 1)
+
+    def test_update_records_bounded_search_match_snippets(self) -> None:
+        digest = ExplorationDigest()
+        huge_match = "src/main.py:10:" + ("x" * (EXPLORATION_DIGEST_MAX_SNIPPET_CHARS * 3))
+        _update_exploration_digest(
+            digest,
+            "search_for_pattern",
+            '{"pattern": "x", "path": "src"}',
+            '{"matches": ["' + huge_match + '"]}',
+            False,
+        )
+        self.assertEqual(digest.total_tool_calls, 1)
+        self.assertEqual(digest.paths_visited, {"src"})
+        self.assertEqual(len(digest.search_matches), 1)
+        self.assertLessEqual(len(digest.search_matches[0]), EXPLORATION_DIGEST_MAX_SNIPPET_CHARS + 1)
+
+    def test_render_digest_snapshot_includes_required_sections_and_status(self) -> None:
+        state = IntermittentReviewState()
+        digest = state.digest
+        digest.total_tool_calls = 3
+        digest.files_read.append("src/main.py")
+        digest.memories_used.add("project_overview.md")
+        digest.tools_invoked.update({"read_file", "read_memory"})
+        digest.degraded_outputs = 1
+        state.last_status = "timeout"
+        state.last_error = "side-call timed out after 37s"
+
+        result = _render_digest_snapshot(
+            model="test/model",
+            timeout_seconds=300,
+            digest=digest,
+            state=state,
+            stop_reason="timeout",
+        )
+
+        self.assertIn("## Summary", result)
+        self.assertIn("## Key Findings", result)
+        self.assertIn("## Exploration Statistics", result)
+        self.assertIn("## Files Explored", result)
+        self.assertIn("## Recommendations", result)
+        self.assertIn("## Questions / Unknowns", result)
+        self.assertIn("test/model", result)
+        self.assertIn("3", result)
+        self.assertIn("src/main.py", result)
+        self.assertIn("project_overview.md", result)
+        self.assertIn("timeout", result)
+        self.assertIn("side-call timed out after 37s", result)
+
+    def test_update_records_read_file_window_path(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "read_file_window",
+            '{"path": "src/utils.py"}',
+            '{"path": "src/utils.py", "content": "..."}',
+            False,
+        )
+        self.assertEqual(digest.files_read, ["src/utils.py"])
+        self.assertEqual(digest.paths_visited, {"src/utils.py"})
+
+    def test_update_records_find_symbol_path(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "find_symbol",
+            '{"path": "src/main.py"}',
+            '{"symbols": ["MyClass", "my_function"]}',
+            False,
+        )
+        self.assertIn("src/main.py", digest.paths_visited)
+        self.assertIn("MyClass", digest.symbols_found)
+        self.assertIn("my_function", digest.symbols_found)
+
+    def test_update_handles_unknown_tool_gracefully(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "unknown_tool_xyz",
+            '{"path": "src/main.py"}',
+            "not json at all",
+            False,
+        )
+        self.assertEqual(digest.total_tool_calls, 1)
+        self.assertIn("unknown_tool_xyz", digest.tools_invoked)
+        self.assertEqual(digest.files_read, [])  # unknown tool, no path extracted
+
+    def test_update_handles_malformed_json_gracefully(self) -> None:
+        digest = ExplorationDigest()
+        _update_exploration_digest(
+            digest,
+            "read_file",
+            "not valid json{{{",
+            "also not json",
+            False,
+        )
+        self.assertEqual(digest.total_tool_calls, 1)
+        self.assertEqual(digest.files_read, [])  # no crash, just empty
+
+    def test_update_deduplicates_file_reads(self) -> None:
+        digest = ExplorationDigest()
+        for _ in range(3):
+            _update_exploration_digest(
+                digest,
+                "read_file",
+                '{"path": "src/main.py"}',
+                '{"path": "src/main.py", "content": "..."}',
+                False,
+            )
+        self.assertEqual(digest.total_tool_calls, 3)
+        self.assertEqual(digest.files_read, ["src/main.py"])  # deduplicated
+
+    def test_render_digest_with_provider_error_stop_reason(self) -> None:
+        state = IntermittentReviewState()
+        state.last_status = "provider_error"
+        state.last_error = "API returned 429"
+        digest = state.digest
+        digest.total_tool_calls = 1
+
+        result = _render_digest_snapshot(
+            model="test/model",
+            timeout_seconds=300,
+            digest=digest,
+            state=state,
+            stop_reason="provider_error",
+        )
+        self.assertIn("stopped (provider_error)", result)
+        self.assertIn("provider_error", result)
+        self.assertIn("API returned 429", result)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Side-call lifecycle tracking
+# ---------------------------------------------------------------------------
+
+
+class TestIntermittentStateDefaults(unittest.TestCase):
+    def test_state_defaults(self) -> None:
+        state = IntermittentReviewState()
+        self.assertEqual(state.last_status, "never_dispatched")
+        self.assertIsNone(state.last_error)
+        self.assertIsNone(state.last_started_at)
+        self.assertIsNone(state.last_finished_at)
+
+
+class TestSideCallLifecycle(unittest.TestCase):
+    """Test that _run_intermittent_review_call records lifecycle status in state."""
+
+    def _make_service(self, client, repo: Path) -> ReviewService:
+        return _make_service(intermittent_n=1, client=client, repo=repo)
+
+    async def _invoke_side(self, service: ReviewService, state: IntermittentReviewState) -> None:
+        await service._run_intermittent_review_call(
+            model="test/model",
+            messages_snapshot=[{"role": "user", "content": "hi"}],
+            use_zai_direct=False,
+            direct_model_name=None,
+            use_kimi_direct=False,
+            direct_kimi_model_name=None,
+            extra_body=None,
+            max_output_tokens=100,
+            snapshot_tool_call_index=1,
+            state=state,
+        )
+
+    def test_successful_side_call_sets_completed(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                client = _ScriptedSideClient([
+                    OpenRouterCallResult(content="## Summary\nPartial review content.", tool_calls=[], raw={}),
+                ])
+                service = self._make_service(client, Path(td))
+                state = IntermittentReviewState()
+                await self._invoke_side(service, state)
+                self.assertEqual(state.last_status, "completed")
+                self.assertIsNone(state.last_error)
+                self.assertIsNotNone(state.last_started_at)
+                self.assertIsNotNone(state.last_finished_at)
+                self.assertGreaterEqual(state.last_finished_at, state.last_started_at)
+
+        asyncio.run(scenario())
+
+    def test_empty_side_call_sets_empty(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                client = _ScriptedSideClient([
+                    OpenRouterCallResult(content="   \n  ", tool_calls=[], raw={}),
+                ])
+                service = self._make_service(client, Path(td))
+                state = IntermittentReviewState()
+                await self._invoke_side(service, state)
+                self.assertEqual(state.last_status, "empty")
+                self.assertIsNone(state.last_error)
+
+        asyncio.run(scenario())
+
+    def test_provider_error_sets_provider_error(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                client = _ScriptedSideClient([RuntimeError("API returned 500")])
+                service = self._make_service(client, Path(td))
+                state = IntermittentReviewState()
+                await self._invoke_side(service, state)
+                self.assertEqual(state.last_status, "provider_error")
+                self.assertIn("API returned 500", state.last_error or "")
+
+        asyncio.run(scenario())
+
+    def test_timeout_sets_timeout_status(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+
+                class _SlowClient:
+                    async def chat_completion(self, **kwargs):
+                        await asyncio.sleep(3600)
+
+                service = self._make_service(_SlowClient(), Path(td))
+                state = IntermittentReviewState()
+                with mock.patch.object(service, "_intermittent_timeout", 0.05):
+                    await self._invoke_side(service, state)
+                self.assertEqual(state.last_status, "timeout")
+                self.assertIsNotNone(state.last_error)
+
+        asyncio.run(scenario())
+
+    def test_dispatch_sets_running(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+
+                class _SlowClient:
+                    async def chat_completion(self, **kwargs):
+                        await asyncio.sleep(3600)
+
+                service = self._make_service(_SlowClient(), Path(td))
+                state = IntermittentReviewState()
+                service._dispatch_intermittent_review(
+                    state=state,
+                    model="test/model",
+                    messages=[{"role": "user", "content": "review"}],
+                    use_zai_direct=False,
+                    direct_model_name=None,
+                    use_kimi_direct=False,
+                    direct_kimi_model_name=None,
+                    use_deepseek_direct=False,
+                    direct_deepseek_model_name=None,
+                    use_ollama_direct=False,
+                    direct_ollama_model_name=None,
+                    extra_body=None,
+                    max_output_tokens=100,
+                )
+                await asyncio.sleep(0.01)
+                self.assertEqual(state.last_status, "running")
+                self.assertIsNotNone(state.last_started_at)
+                if state.in_flight_task and not state.in_flight_task.done():
+                    state.in_flight_task.cancel()
+                    try:
+                        await state.in_flight_task
+                    except asyncio.CancelledError:
+                        pass
+
+        asyncio.run(scenario())
+
+
+class TestIntermittentStatusNote(unittest.TestCase):
+    def test_never_dispatched_note(self) -> None:
+        from lad_mcp_server.review_service import _format_intermittent_status_note
+        state = IntermittentReviewState()
+        note = _format_intermittent_status_note(state)
+        self.assertIn("never_dispatched", note)
+
+    def test_timeout_note_includes_error(self) -> None:
+        from lad_mcp_server.review_service import _format_intermittent_status_note
+        state = IntermittentReviewState()
+        state.last_status = "timeout"
+        state.last_error = "side-call timed out after 37s"
+        note = _format_intermittent_status_note(state)
+        self.assertIn("timeout", note)
+        self.assertIn("side-call timed out after 37s", note)
+
+    def test_completed_note(self) -> None:
+        from lad_mcp_server.review_service import _format_intermittent_status_note
+        state = IntermittentReviewState()
+        state.last_status = "completed"
+        note = _format_intermittent_status_note(state)
+        self.assertIn("completed", note)
+        self.assertNotIn("error", note.lower())
+
+
+# ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
@@ -92,6 +468,94 @@ def _build_settings(intermittent_n: int) -> Settings:
         lad_serena_max_search_results=20,
         intermittent_review_calls=intermittent_n,
     )
+
+
+class TestSelectBestInterimMarkdown(unittest.TestCase):
+    """Test _select_best_interim_markdown priority: snapshot > digest > trace > None."""
+
+    def _serena_ctx(self, *, has_evidence: bool = False) -> mock.Mock:
+        ctx = mock.Mock()
+        if has_evidence:
+            ctx.used_tools = {"read_file"}
+            ctx.used_memories = set()
+            ctx.used_paths = {"src/main.py"}
+        else:
+            ctx.used_tools = set()
+            ctx.used_memories = set()
+            ctx.used_paths = set()
+        return ctx
+
+    def test_substantive_snapshot_wins_over_digest(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = "## Summary\nReal review.\n## Key Findings\n- Bug found"
+        state.digest.total_tool_calls = 5
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=self._serena_ctx(has_evidence=True),
+            stop_reason="timeout",
+        )
+        self.assertIn("Real review", md)
+        self.assertIn("intermittent snapshot", note)
+
+    def test_digest_wins_over_trace_when_no_snapshot(self) -> None:
+        state = IntermittentReviewState()
+        state.digest.total_tool_calls = 3
+        state.digest.files_read.append("src/main.py")
+        state.digest.tools_invoked.add("read_file")
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=self._serena_ctx(has_evidence=True),
+            stop_reason="timeout",
+        )
+        self.assertIsNotNone(md)
+        self.assertIn("src/main.py", md)
+        self.assertIn("deterministic exploration digest", note)
+
+    def test_trace_wins_when_no_snapshot_and_empty_digest(self) -> None:
+        state = IntermittentReviewState()
+        # digest.total_tool_calls == 0 → no digest
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=self._serena_ctx(has_evidence=True),
+            stop_reason="timeout",
+        )
+        self.assertIsNotNone(md)
+        self.assertIn("tool-exploration trace", note)
+
+    def test_none_when_no_evidence(self) -> None:
+        state = IntermittentReviewState()
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=None,
+            stop_reason="timeout",
+        )
+        self.assertIsNone(md)
+        self.assertIn("no interim", note.lower())
+
+    def test_provider_error_stop_reason_uses_digest(self) -> None:
+        state = IntermittentReviewState()
+        state.digest.total_tool_calls = 2
+        state.digest.files_read.append("src/app.py")
+        state.last_status = "provider_error"
+        state.last_error = "API returned 500"
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=self._serena_ctx(has_evidence=True),
+            stop_reason="provider_error",
+        )
+        self.assertIsNotNone(md)
+        self.assertIn("src/app.py", md)
+        self.assertIn("provider_error", note)
 
 
 class _SerenaCtxStub:
@@ -281,6 +745,51 @@ class TestDispatchTrigger(unittest.TestCase):
                 _run_tool_loop_with_mock_dispatch(service, intermittent_state=state)
             )
             self.assertEqual([d["tool_calls_so_far"] for d in dispatches], [1, 2, 3])
+
+    def test_preflight_tools_do_not_trigger_dispatch(self) -> None:
+        """Preflight tool calls should not count toward the intermittent dispatch counter."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            # 3 preflight + 4 exploration + final
+            main_responses = [
+                _tool_call_response("pf1", name="activate_project"),
+                _tool_call_response("pf2", name="read_project_overview"),
+                _tool_call_response("pf3", name="read_baseline_memories"),
+                _tool_call_response("ex1", name="read_file"),
+                _tool_call_response("ex2", name="read_file"),
+                _tool_call_response("ex3", name="search_for_pattern"),
+                _tool_call_response("ex4", name="read_file"),
+                _final_response(),
+            ]
+            client = _MainOnlyClient(main_responses=main_responses)
+            service = _make_service(intermittent_n=2, client=client, repo=repo)
+            state = IntermittentReviewState()
+            _, dispatches = asyncio.run(
+                _run_tool_loop_with_mock_dispatch(service, intermittent_state=state)
+            )
+            # 4 exploration calls with N=2: dispatch at counters 2 and 4.
+            self.assertEqual([d["tool_calls_so_far"] for d in dispatches], [2, 4])
+
+    def test_preflight_tools_with_n_equals_1_dispatch_after_first_exploration(self) -> None:
+        """With N=1, first dispatch should fire after the first non-preflight tool call."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            main_responses = [
+                _tool_call_response("pf1", name="activate_project"),
+                _tool_call_response("pf2", name="read_project_overview"),
+                _tool_call_response("pf3", name="read_baseline_memories"),
+                _tool_call_response("ex1", name="read_file"),
+                _tool_call_response("ex2", name="read_file"),
+                _final_response(),
+            ]
+            client = _MainOnlyClient(main_responses=main_responses)
+            service = _make_service(intermittent_n=1, client=client, repo=repo)
+            state = IntermittentReviewState()
+            _, dispatches = asyncio.run(
+                _run_tool_loop_with_mock_dispatch(service, intermittent_state=state)
+            )
+            # 2 exploration calls with N=1: dispatch at counters 1 and 2.
+            self.assertEqual([d["tool_calls_so_far"] for d in dispatches], [1, 2])
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +1085,7 @@ class TestTimeoutReturnsSnapshot(unittest.TestCase):
                         await asyncio.sleep(0)
                         if tools is None:
                             type(self).side_count += 1
-                            return _final_response("## Summary\nIntermittent snapshot")
+                            return _final_response("## Summary\nFound three critical bugs today.")
                         type(self).main_count += 1
                         # Hang forever to force the reviewer timeout.
                         await hang.wait()
@@ -597,7 +1106,7 @@ class TestTimeoutReturnsSnapshot(unittest.TestCase):
                 # snapshot captured before the timeout fires). This decouples the test
                 # from event-loop scheduling races.
                 state = IntermittentReviewState()
-                state.latest_markdown = "## Summary\nIntermittent snapshot"
+                state.latest_markdown = "## Summary\nFound three critical bugs today."
                 state.snapshot_tool_call_index = 3
                 state.tool_calls_so_far = 3
 
@@ -615,13 +1124,15 @@ class TestTimeoutReturnsSnapshot(unittest.TestCase):
 
                 self.assertTrue(outcome.ok)
                 self.assertTrue(outcome.is_intermittent)
-                self.assertIn("Intermittent snapshot", outcome.markdown)
+                self.assertIn("critical bugs", outcome.markdown)
                 self.assertIn("intermittent", (outcome.provider_note or "").lower())
                 hang.set()
 
         asyncio.run(scenario())
 
-    def test_timeout_without_snapshot_falls_back_to_error_stub(self) -> None:
+    def test_timeout_without_snapshot_falls_back_to_tool_trace_when_serena_was_used(self) -> None:
+        """When intermittent dispatch is disabled but Serena was active, timeout
+        returns the tool-exploration trace (not the generic error stub)."""
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as td:
                 repo = Path(td)
@@ -654,9 +1165,11 @@ class TestTimeoutReturnsSnapshot(unittest.TestCase):
                     requested_paths=None,
                     file_context_builder=_DummyFCB(),
                 )
-                self.assertFalse(outcome.ok)
-                self.assertFalse(outcome.is_intermittent)
-                self.assertIn("Reviewer Error", outcome.markdown)
+                # Tool-trace fallback when Serena was active (even with intermittent disabled)
+                self.assertTrue(outcome.ok)
+                self.assertTrue(outcome.is_intermittent)
+                self.assertIn("tool-exploration trace", outcome.markdown)
+                self.assertNotIn("Reviewer Error", outcome.markdown)
                 hang.set()
 
         asyncio.run(scenario())
@@ -699,6 +1212,168 @@ def _ok_outcome(model: str = "other/model") -> ReviewerOutcome:
         error=None,
         provider="openrouter",
     )
+
+
+class TestTimeoutReturnsDigest(unittest.TestCase):
+    """When no model snapshot exists but digest has evidence, timeout returns digest with ok=True."""
+
+    def _make_service(self, repo: Path) -> ReviewService:
+        openrouter = mock.Mock()
+
+        async def _hang(**kwargs):
+            await asyncio.sleep(3600)
+
+        openrouter.chat_completion = _hang
+        settings = _build_settings(intermittent_n=1)
+        object.__setattr__(settings, "openrouter_reviewer_timeout_seconds", 1)
+        object.__setattr__(settings, "openrouter_tool_call_timeout_seconds", 2)
+        return ReviewService(
+            repo_root=repo,
+            settings=settings,
+            openrouter_client=openrouter,
+            models_client=_ModelsStub("test/model"),
+        )
+
+    def test_timeout_with_digest_returns_ok_true(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                service = self._make_service(repo)
+                cfg = mock.Mock(
+                    model="test/model",
+                    budget=TokenBudget(effective_context_length=50000, effective_output_budget=2000, overhead_tokens=2000),
+                    supported_parameters=("tools",),
+                    tool_calling_supported=True,
+                    tool_choice_supported=True,
+                    serena_ctx=None,
+                    serena_disabled_reason=None,
+                )
+                # Pre-populate digest to simulate tool exploration before timeout
+                state = IntermittentReviewState()
+                state.digest.total_tool_calls = 3
+                state.digest.files_read.append("src/main.py")
+                state.digest.tools_invoked.add("read_file")
+                state.last_status = "timeout"
+                state.last_error = "side-call timed out"
+
+                result = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda **kw: "sys",
+                    build_user_prompt=lambda tool_calling_enabled=False, redacted_inputs=None: "user",
+                    redacted_inputs={"code": "x"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                    intermittent_state_override=state,
+                )
+                self.assertTrue(result.ok)
+                self.assertTrue(result.is_intermittent)
+                self.assertIn("src/main.py", result.markdown)
+                self.assertIn("deterministic exploration digest", result.provider_note)
+
+        asyncio.run(scenario())
+
+    def test_timeout_with_no_evidence_returns_ok_false(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                service = self._make_service(repo)
+                cfg = mock.Mock(
+                    model="test/model",
+                    budget=TokenBudget(effective_context_length=50000, effective_output_budget=2000, overhead_tokens=2000),
+                    supported_parameters=("tools",),
+                    tool_calling_supported=True,
+                    tool_choice_supported=True,
+                    serena_ctx=None,
+                    serena_disabled_reason=None,
+                )
+                result = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda **kw: "sys",
+                    build_user_prompt=lambda tool_calling_enabled=False, redacted_inputs=None: "user",
+                    redacted_inputs={"code": "x"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                    intermittent_state_override=None,
+                )
+                self.assertFalse(result.ok)
+
+        asyncio.run(scenario())
+
+
+class TestExceptionReturnsDigest(unittest.TestCase):
+    """Provider error after tool exploration returns digest, not error stub."""
+
+    def test_provider_error_with_digest_returns_ok_true(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                openrouter = mock.Mock()
+                openrouter.chat_completion = mock.AsyncMock(side_effect=RuntimeError("API 500"))
+                service = _make_service(intermittent_n=1, client=openrouter, repo=repo)
+                cfg = mock.Mock(
+                    model="test/model",
+                    budget=TokenBudget(effective_context_length=50000, effective_output_budget=2000, overhead_tokens=2000),
+                    supported_parameters=("tools",),
+                    tool_calling_supported=True,
+                    tool_choice_supported=True,
+                    serena_ctx=None,
+                    serena_disabled_reason=None,
+                )
+                state = IntermittentReviewState()
+                state.digest.total_tool_calls = 2
+                state.digest.files_read.append("src/app.py")
+                state.last_status = "provider_error"
+                state.last_error = "API 500"
+
+                result = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda **kw: "sys",
+                    build_user_prompt=lambda tool_calling_enabled=False, redacted_inputs=None: "user",
+                    redacted_inputs={"code": "x"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                    intermittent_state_override=state,
+                )
+                self.assertTrue(result.ok)
+                self.assertTrue(result.is_intermittent)
+                self.assertIn("src/app.py", result.markdown)
+                self.assertIn("API 500", result.provider_note)
+
+        asyncio.run(scenario())
+
+    def test_provider_error_with_no_digest_returns_ok_false(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                openrouter = mock.Mock()
+                openrouter.chat_completion = mock.AsyncMock(side_effect=RuntimeError("API 500"))
+                service = _make_service(intermittent_n=1, client=openrouter, repo=repo)
+                cfg = mock.Mock(
+                    model="test/model",
+                    budget=TokenBudget(effective_context_length=50000, effective_output_budget=2000, overhead_tokens=2000),
+                    supported_parameters=("tools",),
+                    tool_calling_supported=True,
+                    tool_choice_supported=True,
+                    serena_ctx=None,
+                    serena_disabled_reason=None,
+                )
+                result = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda **kw: "sys",
+                    build_user_prompt=lambda tool_calling_enabled=False, redacted_inputs=None: "user",
+                    redacted_inputs={"code": "x"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                    intermittent_state_override=None,
+                )
+                self.assertFalse(result.ok)
+                self.assertIn("Reviewer Error", result.markdown)
+
+        asyncio.run(scenario())
 
 
 class TestDisclosureAndSynthesis(unittest.TestCase):
@@ -745,13 +1420,456 @@ class TestDisclosureAndSynthesis(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: Review-shaped tool trace fallback
+# ---------------------------------------------------------------------------
+
+
+class TestToolTraceRequiredSections(unittest.TestCase):
+    """Phase 1.1: _build_tool_trace_summary must produce all required sections."""
+
+    def test_trace_contains_all_required_sections(self) -> None:
+        md = _build_tool_trace_summary(
+            model="test/model",
+            timeout_seconds=300,
+            tool_calls_made=3,
+            tools_invoked={"read_file", "find_symbol"},
+            memories_used={"overview.md"},
+            paths_used={"src/main.py"},
+        )
+        for section in ("## Summary", "## Key Findings", "## Recommendations", "## Questions / Unknowns"):
+            self.assertIn(section, md, f"Missing required section: {section}")
+
+    def test_normalize_does_not_append_placeholders_to_trace(self) -> None:
+        from lad_mcp_server.markdown import normalize_reviewer_markdown
+        md = _build_tool_trace_summary(
+            model="test/model",
+            timeout_seconds=300,
+            tool_calls_made=1,
+            tools_invoked={"read_file"},
+            memories_used=set(),
+            paths_used={"src/app.py"},
+        )
+        normalized = normalize_reviewer_markdown(md)
+        self.assertNotIn("*(No Key Findings provided by reviewer)*", normalized)
+        self.assertNotIn("*(No Questions / Unknowns provided by reviewer)*", normalized)
+
+    def test_trace_with_empty_evidence_still_has_all_sections(self) -> None:
+        md = _build_tool_trace_summary(
+            model="test/model",
+            timeout_seconds=60,
+            tool_calls_made=0,
+            tools_invoked=set(),
+            memories_used=set(),
+            paths_used=set(),
+        )
+        for section in ("## Summary", "## Key Findings", "## Recommendations", "## Questions / Unknowns"):
+            self.assertIn(section, md, f"Missing required section with empty evidence: {section}")
+
+
+class TestPlaceholderSnapshotFallsBackToTrace(unittest.TestCase):
+    """Phase 1.2: Placeholder-only snapshot should fall back to trace/digest."""
+
+    def test_select_best_prefers_digest_over_placeholder_snapshot(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = "## Summary\n*(No Summary provided by reviewer)*"
+        state.digest.total_tool_calls = 2
+        state.digest.files_read.append("src/main.py")
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=None,
+            stop_reason="timeout",
+        )
+        # Digest should win over placeholder snapshot
+        self.assertIn("src/main.py", md)
+        self.assertIn("deterministic exploration digest", note)
+
+    def test_select_best_prefers_trace_over_placeholder_snapshot(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = "## Summary\n*(No Summary provided by reviewer)*"
+        # No digest evidence but serena has tools
+        serena_ctx = mock.Mock()
+        serena_ctx.used_tools = {"read_file"}
+        serena_ctx.used_memories = set()
+        serena_ctx.used_paths = {"src/main.py"}
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=serena_ctx,
+            stop_reason="timeout",
+        )
+        self.assertIn("tool-exploration trace", note)
+        self.assertIn("src/main.py", md)
+
+    def test_substantive_snapshot_still_wins_over_digest(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = "## Summary\nFound three critical bugs today.\n## Key Findings\n- Bug in auth"
+        state.digest.total_tool_calls = 5
+        state.digest.files_read.append("src/main.py")
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=None,
+            stop_reason="timeout",
+        )
+        self.assertIn("critical bugs", md)
+        self.assertIn("intermittent snapshot", note)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Grace period semantics
+# ---------------------------------------------------------------------------
+
+
+class TestGracePeriodShield(unittest.TestCase):
+    """Phase 6.1: Grace wait uses asyncio.shield so side-call survives grace expiry."""
+
+    def test_grace_expiry_does_not_cancel_side_call(self) -> None:
+        """When grace period expires, the in-flight side-call task is NOT cancelled."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                side_completed = asyncio.Event()
+
+                class _Client:
+                    call_count = 0
+
+                    async def chat_completion(self, **kwargs):
+                        type(self).call_count += 1
+                        if kwargs.get("tools") is None:
+                            # Side call — slow but completes after grace would expire
+                            await asyncio.sleep(0.3)
+                            side_completed.set()
+                            return OpenRouterCallResult(
+                                content="## Summary\nFound three critical bugs in the parser module.",
+                                tool_calls=[],
+                                raw={},
+                            )
+                        else:
+                            # Main call — return one tool call then hang
+                            return OpenRouterCallResult(
+                                content="",
+                                tool_calls=[{"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.py\"}"}}],
+                                raw={},
+                            )
+
+                client = _Client()
+                settings = _build_settings(intermittent_n=1)
+                object.__setattr__(settings, "openrouter_reviewer_timeout_seconds", 2)
+                object.__setattr__(settings, "openrouter_tool_call_timeout_seconds", 5)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                _ = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                # Side-call should complete despite grace expiry
+                self.assertTrue(side_completed.is_set(), "Side-call should have completed")
+
+        asyncio.run(scenario())
+
+    def test_side_call_completing_during_grace_updates_snapshot(self) -> None:
+        """Side-call that completes during grace should update latest_markdown."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                class _Client:
+                    async def chat_completion(self, **kwargs):
+                        if kwargs.get("tools") is None:
+                            return OpenRouterCallResult(
+                                content="## Summary\nFound two bugs in authentication flow.",
+                                tool_calls=[],
+                                raw={},
+                            )
+                        else:
+                            return OpenRouterCallResult(
+                                content="",
+                                tool_calls=[{"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.py\"}"}}],
+                                raw={},
+                            )
+
+                client = _Client()
+                settings = _build_settings(intermittent_n=1)
+                object.__setattr__(settings, "openrouter_reviewer_timeout_seconds", 2)
+                object.__setattr__(settings, "openrouter_tool_call_timeout_seconds", 5)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                outcome = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                self.assertTrue(outcome.ok)
+                self.assertIn("authentication flow", outcome.markdown)
+
+        asyncio.run(scenario())
+
+
+class TestGracePeriodBound(unittest.TestCase):
+    """Phase 6.2: Grace period is bounded by outer-envelope remaining time."""
+
+    def test_tight_timeout_skips_grace_entirely(self) -> None:
+        """When remaining budget is exhausted, grace wait is skipped."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                side_started = asyncio.Event()
+
+                class _Client:
+                    async def chat_completion(self, **kwargs):
+                        if kwargs.get("tools") is None:
+                            side_started.set()
+                            await asyncio.sleep(0.5)
+                            return OpenRouterCallResult(
+                                content="## Summary\nFound a bug.",
+                                tool_calls=[],
+                                raw={},
+                            )
+                        await asyncio.Event().wait()
+
+                client = _Client()
+                settings = _build_settings(intermittent_n=1)
+                # Very tight timeout: 1s reviewer, 1s tool_call
+                object.__setattr__(settings, "openrouter_reviewer_timeout_seconds", 1)
+                object.__setattr__(settings, "openrouter_tool_call_timeout_seconds", 1)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                start = time.monotonic()
+                _ = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                elapsed = time.monotonic() - start
+                # With 1s reviewer + 1s tool_call timeout, total should not exceed ~3s
+                # (grace should be 0 or very small, not 30s)
+                self.assertLess(elapsed, 5.0, f"Total elapsed {elapsed:.1f}s — grace not bounded")
+
+        asyncio.run(scenario())
+
+    def test_grace_seconds_formula_clamps_to_remaining_budget(self) -> None:
+        """Unit test: grace formula returns 0 when remaining budget is exhausted."""
+        from lad_mcp_server.review_service import _compute_grace_seconds
+        # remaining = 3s, which is < 5 (min grace) → grace = 0
+        grace = _compute_grace_seconds(
+            tool_call_timeout_seconds=10,
+            reviewer_start=time.monotonic() - 8,  # 8s elapsed → 2s remaining - 5s reserve = negative
+        )
+        self.assertEqual(grace, 0)
+
+    def test_grace_seconds_formula_normal_case(self) -> None:
+        """Unit test: normal case with ample remaining budget."""
+        from lad_mcp_server.review_service import _compute_grace_seconds
+        # remaining = 60s - 5s reserve = 55s → base = max(5, min(15, 55//3)) = max(5,15) = 15
+        grace = _compute_grace_seconds(
+            tool_call_timeout_seconds=120,
+            reviewer_start=time.monotonic() - 60,
+        )
+        self.assertGreater(grace, 0)
+        self.assertLessEqual(grace, 15)
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Regression matrix — intermittent failure modes
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionSideCallEmptyContent(unittest.TestCase):
+    """Side-call that returns empty content should fall back to digest/trace."""
+
+    def test_empty_side_call_falls_back_to_digest(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = ""
+        state.digest.total_tool_calls = 2
+        state.digest.files_read.append("src/main.py")
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=None,
+            stop_reason="timeout",
+        )
+        # Empty snapshot is not substantive → digest wins
+        self.assertIn("src/main.py", md)
+        self.assertIn("deterministic exploration digest", note)
+
+
+class TestRegressionSideCallPlaceholderOnly(unittest.TestCase):
+    """Side-call that returns placeholder-only markdown should fall back to digest/trace."""
+
+    def test_placeholder_only_falls_back_to_digest(self) -> None:
+        state = IntermittentReviewState()
+        state.latest_markdown = (
+            "## Summary\n*(No Summary provided by reviewer)*\n"
+            "## Key Findings\n*(No Key Findings provided by reviewer)*"
+        )
+        state.digest.total_tool_calls = 3
+        state.digest.files_read.append("src/app.py")
+        md, note = _select_best_interim_markdown(
+            model="test/model",
+            timeout_seconds=300,
+            state=state,
+            serena_ctx=None,
+            stop_reason="timeout",
+        )
+        self.assertIn("src/app.py", md)
+        self.assertIn("deterministic exploration digest", note)
+
+
+class TestRegressionQueuedSnapshotReplaces(unittest.TestCase):
+    """Queued snapshot replaces older queued snapshot — state-level test."""
+
+    def test_newer_queued_snapshot_replaces_older(self) -> None:
+        state = IntermittentReviewState()
+        # When in_flight_task is running, new dispatches overwrite queued_snapshot
+        old_request = {"snapshot": "## Summary\nOld content.", "snapshot_tool_call_index": 3}
+        state.queued_snapshot = old_request
+        new_request = {"snapshot": "## Summary\nNew content.", "snapshot_tool_call_index": 5}
+        state.queued_snapshot = new_request
+        self.assertEqual(state.queued_snapshot["snapshot"], "## Summary\nNew content.")
+        self.assertEqual(state.queued_snapshot["snapshot_tool_call_index"], 5)
+
+
+class TestRegressionProviderNoteContainsError(unittest.TestCase):
+    """provider_note contains original exception message on generic exception + interim recovery."""
+
+    def test_provider_note_contains_exception_message(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                openrouter = mock.Mock()
+                openrouter.chat_completion = mock.AsyncMock(side_effect=RuntimeError("Connection refused: API gateway unreachable"))
+                service = _make_service(intermittent_n=1, client=openrouter, repo=repo)
+                cfg = mock.Mock(
+                    model="test/model",
+                    budget=TokenBudget(effective_context_length=50000, effective_output_budget=2000, overhead_tokens=2000),
+                    supported_parameters=("tools",),
+                    tool_calling_supported=True,
+                    tool_choice_supported=True,
+                    serena_ctx=None,
+                    serena_disabled_reason=None,
+                )
+                state = IntermittentReviewState()
+                state.digest.total_tool_calls = 2
+                state.digest.files_read.append("src/main.py")
+                state.last_status = "provider_error"
+                state.last_error = "Connection refused"
+
+                result = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda **kw: "sys",
+                    build_user_prompt=lambda tool_calling_enabled=False, redacted_inputs=None: "user",
+                    redacted_inputs={"code": "x"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                    intermittent_state_override=state,
+                )
+                self.assertTrue(result.ok)
+                self.assertIn("Connection refused", result.provider_note)
+
+        asyncio.run(scenario())
+
+
+class TestRegressionStateResetBetweenReviews(unittest.TestCase):
+    """IntermittentReviewState is discarded/reset between reviews."""
+
+    def test_fresh_state_each_review(self) -> None:
+        state1 = IntermittentReviewState()
+        state1.latest_markdown = "## Summary\nOld review content."
+        state1.digest.total_tool_calls = 5
+        state1.snapshot_tool_call_index = 3
+
+        state2 = IntermittentReviewState()
+        self.assertIsNone(state2.latest_markdown)
+        self.assertEqual(state2.digest.total_tool_calls, 0)
+        self.assertEqual(state2.snapshot_tool_call_index, 0)
+        self.assertEqual(state2.tool_calls_so_far, 0)
+
+
+class TestRegressionDigestNoFullFileContents(unittest.TestCase):
+    """ExplorationDigest does not persist full file contents."""
+
+    def test_large_file_content_not_stored(self) -> None:
+        digest = ExplorationDigest()
+        large_content = "x" * (2 * 1024 * 1024)  # 2MB
+        _update_exploration_digest(
+            digest,
+            "read_file",
+            '{"path": "src/big.py"}',
+            f'{{"path": "src/big.py", "content": "{large_content}"}}',
+            False,
+        )
+        self.assertEqual(digest.files_read, ["src/big.py"])
+        # Verify no massive string is stored in the digest
+        for attr in vars(digest):
+            val = getattr(digest, attr)
+            if isinstance(val, str):
+                self.assertLess(len(val), 1024 * 1024, f"Digest attr '{attr}' exceeds 1MB")
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        self.assertLess(len(item), 1024 * 1024, f"Digest list item in '{attr}' exceeds 1MB")
+
+    def test_search_match_snippets_are_bounded(self) -> None:
+        digest = ExplorationDigest()
+        huge_match = "src/main.py:10:" + "x" * 5000
+        _update_exploration_digest(
+            digest,
+            "search_for_pattern",
+            '{"pattern": "x", "path": "src"}',
+            f'{{"matches": ["{huge_match}"]}}',
+            False,
+        )
+        self.assertEqual(len(digest.search_matches), 1)
+        self.assertLessEqual(len(digest.search_matches[0]), EXPLORATION_DIGEST_MAX_SNIPPET_CHARS + 1)
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 
 class TestConstants(unittest.TestCase):
-    def test_intermittent_review_timeout_seconds_is_120(self) -> None:
-        self.assertEqual(INTERMITTENT_REVIEW_TIMEOUT_SECONDS, 120)
+    def test_intermittent_review_timeout_seconds_is_45(self) -> None:
+        self.assertEqual(INTERMITTENT_REVIEW_TIMEOUT_SECONDS, 45)
 
 
 if __name__ == "__main__":

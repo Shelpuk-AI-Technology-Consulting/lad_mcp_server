@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
 import asyncio
 import atexit
+import copy
 import json
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
@@ -44,7 +46,7 @@ TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
 KIMI_FALLBACK_TTL_SECONDS = 600
 KIMI_FALLBACK_CACHE_MAX_MODELS = 128
-INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 120
+INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 45
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -53,6 +55,30 @@ TOOL_DEGRADATION_SYSTEM_HINT = (
 DEEPER_EXPLORATION_TOOL_NAMES = frozenset(
     {"list_dir", "read_file", "read_file_window", "search_for_pattern", "find_symbol"}
 )
+
+PREFLIGHT_TOOL_NAMES = frozenset(
+    {"activate_project", "read_project_overview", "read_baseline_memories"}
+)
+
+EXPLORATION_DIGEST_MAX_SNIPPET_CHARS = 200
+
+_SUBSTANTIVE_PLACEHOLDER_RE = re.compile(
+    r"^\*\([^)]+\)\*$|"  # *(No Summary provided by reviewer)*
+    r"^#{1,4}\s+.+$",     # markdown section headers
+    re.MULTILINE,
+)
+
+FINAL_RENDER_RESERVE_SECONDS = 5  # reserved for rendering + aggregation after grace
+
+
+def _bounded_digest_snippet(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    snippet = value.strip().replace("\n", " ")
+    if len(snippet) > EXPLORATION_DIGEST_MAX_SNIPPET_CHARS:
+        return snippet[:EXPLORATION_DIGEST_MAX_SNIPPET_CHARS] + "…"
+    return snippet
+
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
@@ -163,6 +189,81 @@ def _extract_tool_result_object(tool_output: str) -> dict[str, Any] | None:
     return inner if inner is not None else outer
 
 
+def _add_unique_list_item(items: list[str], value: str | None) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _extract_path_from_arguments(arguments_json: str) -> str | None:
+    args = _load_json_object(arguments_json)
+    if args is None:
+        return None
+    raw_path = args.get("path") or args.get("relative_path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    return raw_path.strip()
+
+
+def _update_exploration_digest(
+    digest: "ExplorationDigest",
+    fn_name: str,
+    arguments_json: str,
+    tool_output: str,
+    is_degraded: bool,
+) -> None:
+    digest.total_tool_calls += 1
+    if fn_name:
+        digest.tools_invoked.add(fn_name)
+    if is_degraded:
+        digest.degraded_outputs += 1
+
+    args_path = _extract_path_from_arguments(arguments_json)
+    result = _extract_tool_result_object(tool_output) or {}
+
+    if fn_name in {"read_file", "read_file_window"}:
+        path = result.get("path") if isinstance(result.get("path"), str) else args_path
+        if isinstance(path, str) and path:
+            _add_unique_list_item(digest.files_read, path)
+            digest.paths_visited.add(path)
+    elif fn_name == "read_memory":
+        memory_name = result.get("name") if isinstance(result.get("name"), str) else None
+        if memory_name is None:
+            memory_name = _extract_read_memory_name(arguments_json)
+        if memory_name:
+            digest.memories_used.add(_normalize_memory_name(memory_name))
+    elif fn_name == "read_baseline_memories":
+        loaded = result.get("loaded")
+        if isinstance(loaded, list):
+            for item in loaded:
+                if isinstance(item, dict) and isinstance(item.get("name"), str):
+                    digest.memories_used.add(_normalize_memory_name(item["name"]))
+        present = result.get("present")
+        if isinstance(present, list):
+            for item in present:
+                if isinstance(item, str):
+                    digest.memories_used.add(_normalize_memory_name(item))
+    elif fn_name == "find_symbol":
+        if args_path:
+            digest.paths_visited.add(args_path)
+        symbols = result.get("symbols") or result.get("result")
+        if isinstance(symbols, list):
+            for item in symbols[:20]:
+                if isinstance(item, str):
+                    _add_unique_list_item(digest.symbols_found, item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("name_path")
+                    if isinstance(name, str):
+                        _add_unique_list_item(digest.symbols_found, name)
+    elif fn_name == "search_for_pattern":
+        if args_path:
+            digest.paths_visited.add(args_path)
+        matches = result.get("matches")
+        if isinstance(matches, list):
+            for match in matches[:20]:
+                snippet = _bounded_digest_snippet(match)
+                _add_unique_list_item(digest.search_matches, snippet)
+
+
 def _preflight_validation_message(missing_required: set[str]) -> str:
     if not missing_required:
         return "Preflight memory checklist validation: all required preflight memories are loaded."
@@ -182,16 +283,11 @@ def _is_substantive_review_content(content: str) -> bool:
     """Check whether review content has at least one substantive line beyond placeholders."""
     if not content or not content.strip():
         return False
-    placeholder_re = __import__("re").compile(
-        r"^\*\([^)]+\)\*$|"  # *(No Summary provided by reviewer)*
-        r"^#{1,4}\s+.+$",     # markdown section headers
-        __import__("re").MULTILINE,
-    )
     for line in content.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        if placeholder_re.match(stripped):
+        if _SUBSTANTIVE_PLACEHOLDER_RE.match(stripped):
             continue
         # At least one line with 3+ words that isn't a placeholder
         words = stripped.split()
@@ -218,6 +314,9 @@ def _build_tool_trace_summary(
         "## Summary\n"
         f"Reviewer (`{model}`) timed out after {timeout_seconds}s during tool-assisted exploration.\n"
         "This is a **tool-exploration trace summary**, not a model-generated review.\n\n"
+        "## Key Findings\n"
+        "- **Info**: No model-generated findings — reviewer timed out before synthesis.\n"
+        f"- **Info**: Explored {len(paths_used)} file(s) using {tool_calls_made} tool call(s).\n\n"
         "## Exploration Statistics\n"
         f"- **Tool calls made**: {tool_calls_made}\n"
         f"- **Tools invoked**: {tools_list}\n"
@@ -229,7 +328,9 @@ def _build_tool_trace_summary(
         f"{tools_list}\n\n"
         "## Recommendations\n"
         "- Re-run the review with a longer timeout to get a full model-generated review.\n"
-        "- Consider reducing the scope (fewer files) to fit within the timeout budget.\n"
+        "- Consider reducing the scope (fewer files) to fit within the timeout budget.\n\n"
+        "## Questions / Unknowns\n"
+        "- What substantive findings would the reviewer have produced?\n"
     )
 
 
@@ -250,6 +351,22 @@ class ReviewerOutcome:
     is_intermittent: bool = False
 
 
+
+@dataclass
+class ExplorationDigest:
+    files_read: list[str] = field(default_factory=list)
+    symbols_found: list[str] = field(default_factory=list)
+    search_matches: list[str] = field(default_factory=list)
+    llm_findings: list[str] = field(default_factory=list)
+    llm_recommendations: list[str] = field(default_factory=list)
+    llm_open_questions: list[str] = field(default_factory=list)
+    tools_invoked: set[str] = field(default_factory=set)
+    memories_used: set[str] = field(default_factory=set)
+    paths_visited: set[str] = field(default_factory=set)
+    degraded_outputs: int = 0
+    total_tool_calls: int = 0  # includes preflight calls, used for coverage reporting
+
+
 class IntermittentReviewState:
     """
     Per-reviewer holder for the latest intermittent (partial) review snapshot.
@@ -266,6 +383,12 @@ class IntermittentReviewState:
         "tool_calls_so_far",
         "in_flight_task",
         "queued_snapshot",
+        "_preflight_complete",
+        "digest",
+        "last_status",
+        "last_error",
+        "last_started_at",
+        "last_finished_at",
     )
 
     def __init__(self) -> None:
@@ -274,6 +397,12 @@ class IntermittentReviewState:
         self.tool_calls_so_far: int = 0
         self.in_flight_task: asyncio.Task[None] | None = None
         self.queued_snapshot: dict[str, Any] | None = None
+        self._preflight_complete: bool = False
+        self.digest: ExplorationDigest = ExplorationDigest()
+        self.last_status: str = "never_dispatched"
+        self.last_error: str | None = None
+        self.last_started_at: float | None = None
+        self.last_finished_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -348,7 +477,7 @@ class ReviewService:
         # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
         self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
-        self._intermittent_timeout = max(120, self._settings.openrouter_reviewer_timeout_seconds // 2)
+        self._intermittent_timeout = min(45, max(20, self._settings.openrouter_reviewer_timeout_seconds // 8))
         self._tool_choice_fallback_until_by_model: dict[str, float] = {}
         self._tool_choice_fallback_lock = threading.Lock()
         self._kimi_fallback_until_by_model: dict[str, float] = {}
@@ -536,8 +665,7 @@ class ReviewService:
                 return result
             except Exception as exc:
                 note = f"DeepSeek endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                if not provider_notes:
-                    provider_notes.append(note)
+                provider_notes.append(note)
                 provider_used[:] = ["openrouter"]
                 log.warning("Direct DeepSeek call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
@@ -556,8 +684,7 @@ class ReviewService:
                 return result
             except Exception as exc:
                 note = f"Ollama Cloud endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                if not provider_notes:
-                    provider_notes.append(note)
+                provider_notes.append(note)
                 provider_used[:] = ["openrouter"]
                 log.warning("Direct Ollama call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
@@ -576,8 +703,7 @@ class ReviewService:
                 return result
             except Exception as exc:
                 note = f"Z.AI Coding Plan endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                if not provider_notes:
-                    provider_notes.append(note)
+                provider_notes.append(note)
                 provider_used[:] = ["openrouter"]
                 log.warning("Direct Z.AI call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
@@ -598,8 +724,7 @@ class ReviewService:
                 except Exception as exc:
                     self._remember_kimi_fallback(model)
                     note = f"Kimi Code endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                    if not provider_notes:
-                        provider_notes.append(note)
+                    provider_notes.append(note)
                     provider_used[:] = ["openrouter"]
                     log.warning("Direct Kimi Code call failed for model '%s'; falling back to OpenRouter: %s", model, note)
 
@@ -644,6 +769,9 @@ class ReviewService:
         # Fresh per-call provider trackers so the side call doesn't mutate the main reviewer's.
         side_provider_used: list[str] = ["openrouter"]
         side_provider_notes: list[str] = []
+        state.last_status = "running"
+        state.last_started_at = time.monotonic()
+        state.last_error = None
         try:
             result = await asyncio.wait_for(
                 self._call_model_with_provider_fallback(
@@ -668,15 +796,29 @@ class ReviewService:
                 timeout=self._intermittent_timeout,
             )
         except asyncio.CancelledError:
+            state.last_status = "cancelled"
+            state.last_finished_at = time.monotonic()
             raise
+        except asyncio.TimeoutError:
+            state.last_status = "timeout"
+            state.last_error = f"side-call timed out after {self._intermittent_timeout}s"
+            state.last_finished_at = time.monotonic()
+            log.info("Intermittent review side call timed out for model '%s'", model)
+            return
         except Exception as exc:
+            state.last_status = "provider_error"
+            state.last_error = str(exc)
+            state.last_finished_at = time.monotonic()
             log.info("Intermittent review side call failed for model '%s': %s", model, exc)
             return
 
         content = (result.content or "").strip()
+        state.last_finished_at = time.monotonic()
         if not content:
+            state.last_status = "empty"
             log.info("Intermittent review side call for model '%s' returned empty/whitespace content", model)
         else:
+            state.last_status = "completed"
             # Single-threaded event loop = atomic update without lock.
             state.latest_markdown = result.content
             state.snapshot_tool_call_index = snapshot_tool_call_index
@@ -722,7 +864,9 @@ class ReviewService:
         If a prior task is still in flight, keep it running and remember the latest
         requested snapshot. The running task will dispatch the queued snapshot after it completes.
         """
-        snapshot_messages: list[dict[str, Any]] = list(messages)
+        # Use deepcopy: _tool_loop mutates message dicts in-place between dispatches.
+        # A shallow copy would let the in-flight side-call observe partially mutated messages.
+        snapshot_messages: list[dict[str, Any]] = copy.deepcopy(messages)
         snapshot_messages.append(_build_user_message(intermittent_review_finalize_user_message()))
 
         request = {
@@ -897,10 +1041,10 @@ class ReviewService:
             redacted_inputs[k] = redact_text(v)
 
         direct_required = ["proposal"] if tool_name == "system_design_review" else ["code"]
-        for field in direct_required:
+        for req_field in direct_required:
             # Only enforce non-empty if direct input was actually supplied.
-            if field in redaction_inputs and redaction_inputs.get(field) is not None:
-                if redacted_inputs.get(field, "").strip() == "":
+            if req_field in redaction_inputs and redaction_inputs.get(req_field) is not None:
+                if redacted_inputs.get(req_field, "").strip() == "":
                     raise ValidationError("Content is empty after sanitization")
 
         if tool_name == "system_design_review":
@@ -920,6 +1064,7 @@ class ReviewService:
                 "paths resolve to an unsafe project root; provide paths under a real repository directory"
             )
         file_context_builder = FileContextBuilder(repo_root=resolved_root)
+        reviewer_start = time.monotonic()
 
         # R8: If model metadata fetch fails, fail closed (no OpenRouter completion requests are sent).
         primary_cfg = self._prepare_reviewer_config(primary_model, repo_root=resolved_root)
@@ -936,6 +1081,7 @@ class ReviewService:
                 redacted_inputs=redacted_inputs,
                 requested_paths=requested_paths,
                 file_context_builder=file_context_builder,
+                reviewer_start=reviewer_start,
             )
         )
 
@@ -957,6 +1103,7 @@ class ReviewService:
                 build_user_prompt=build_user_prompt,
                 redacted_inputs=redacted_inputs,
                 requested_paths=requested_paths,
+                reviewer_start=reviewer_start,
                 file_context_builder=file_context_builder,
             )
         )
@@ -1152,7 +1299,10 @@ class ReviewService:
         requested_paths: list[str] | None,
         file_context_builder: FileContextBuilder,
         intermittent_state_override: IntermittentReviewState | None = None,
+        reviewer_start: float | None = None,
     ) -> ReviewerOutcome:
+        if reviewer_start is None:
+            reviewer_start = time.monotonic()
         model = cfg.model
         budget = cfg.budget
         serena_ctx = cfg.serena_ctx
@@ -1270,49 +1420,56 @@ class ReviewService:
                 provider_note=provider_notes[0] if provider_notes else None,
             )
         except (TimeoutError, asyncio.TimeoutError):
-            # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
             timeout_seconds = self._settings.openrouter_reviewer_timeout_seconds
-            # Give an in-flight intermittent side-call a short grace period to finish.
-            # Reasoning models can spend most of the side-call budget on thinking tokens,
-            # so a brief wait (proportional to the intermittent timeout) is the best chance
-            # to get a substantive snapshot. Only cancel after the grace period.
-            grace_seconds = max(5, min(30, self._intermittent_timeout // 4))
-            if intermittent_state is not None and intermittent_state.in_flight_task is not None:
+            # Give an in-flight intermittent side-call a bounded grace period to finish.
+            # asyncio.shield prevents grace expiry from cancelling the side-call.
+            grace_seconds = _compute_grace_seconds(
+                tool_call_timeout_seconds=self._settings.openrouter_tool_call_timeout_seconds,
+                reviewer_start=reviewer_start,
+            )
+            if grace_seconds > 0 and intermittent_state is not None and intermittent_state.in_flight_task is not None:
                 try:
                     await asyncio.wait_for(
-                        intermittent_state.in_flight_task,
+                        asyncio.shield(intermittent_state.in_flight_task),
                         timeout=grace_seconds,
                     )
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
+                    raise
+                except (asyncio.TimeoutError, Exception):
                     pass
-            self._cancel_in_flight_intermittent(intermittent_state)
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
 
-            # If we have a cached intermittent snapshot, return it instead of the error stub.
-            # Try intermittent snapshot first — return if substantive.
-            if intermittent_state is not None and intermittent_state.latest_markdown:
-                snapshot = intermittent_state.latest_markdown
-                snapshot_is_substantive = _is_substantive_review_content(snapshot)
-                note = (
-                    f"Reviewer timed out after {timeout_seconds}s while still exploring "
-                    f"({intermittent_state.tool_calls_so_far} tool calls made); "
-                    f"returning intermittent snapshot captured at tool call "
-                    f"{intermittent_state.snapshot_tool_call_index}."
+            if intermittent_state is not None:
+                best_md, best_note = _select_best_interim_markdown(
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    state=intermittent_state,
+                    serena_ctx=serena_ctx,
+                    stop_reason="timeout",
                 )
-                if not snapshot_is_substantive:
-                    note += " Snapshot contains placeholder-only content; see tool-exploration trace below."
-                # Build tool-trace fallback to append if snapshot is not substantive.
-                markdown = snapshot
-                if not snapshot_is_substantive and serena_ctx is not None:
-                    trace = _build_tool_trace_summary(
-                        model=model,
-                        timeout_seconds=timeout_seconds,
-                        tool_calls_made=intermittent_state.tool_calls_so_far,
-                        tools_invoked=serena_ctx.used_tools,
-                        memories_used=serena_ctx.used_memories,
-                        paths_used=serena_ctx.used_paths,
-                    )
-                    markdown = snapshot.rstrip() + "\n\n---\n\n" + trace
+            elif serena_ctx is not None:
+                trace = _build_tool_trace_summary(
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    tool_calls_made=len(serena_ctx.used_tools),
+                    tools_invoked=serena_ctx.used_tools,
+                    memories_used=serena_ctx.used_memories,
+                    paths_used=serena_ctx.used_paths,
+                )
+                if trace.strip():
+                    best_md = trace
+                    best_note = "Returning tool-exploration trace summary as fallback."
+                else:
+                    best_md, best_note = None, "No interim markdown available."
+            else:
+                best_md, best_note = None, "No intermittent state."
+
+            # Clean up in-flight task after reading state — shield ensured it was
+            # not cancelled by grace expiry, but we cancel now before returning.
+            self._cancel_in_flight_intermittent(intermittent_state)
+
+            timeout_prefix = f"Reviewer timed out after {timeout_seconds}s. "
+            if best_md is not None:
                 return ReviewerOutcome(
                     ok=True,
                     model=model,
@@ -1322,44 +1479,79 @@ class ReviewService:
                     serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
                     serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
                     serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
-                    markdown=markdown,
+                    markdown=best_md,
                     error=None,
                     provider=provider_used[0],
-                    provider_note=note,
+                    provider_note=timeout_prefix + best_note,
                     is_intermittent=True,
                 )
 
-            # No snapshot — synthesize tool-trace fallback if Serena was active.
-            if serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_paths):
+            return ReviewerOutcome(
+                ok=False,
+                model=model,
+                used_serena=used_serena,
+                serena_disabled_reason=serena_disabled_reason,
+                serena_activated_project=serena_ctx.activated_project if serena_ctx is not None else None,
+                serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
+                serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
+                serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
+                markdown=_format_reviewer_error(model, f"Reviewer timed out after {timeout_seconds}s"),
+                error=f"Reviewer timed out after {timeout_seconds}s",
+                provider=provider_used[0],
+                provider_note=provider_notes[0] if provider_notes else None,
+            )
+        except Exception as exc:
+            msg = _exc_message(exc)
+            used_serena = serena_ctx is not None and (
+                serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths
+            )
+            # IMPORTANT: Read interim state BEFORE cancelling the in-flight task.
+            # No await between here and _cancel_in_flight_intermittent below —
+            # the single-threaded event loop ensures state is consistent.
+            if intermittent_state is not None:
+                best_md, best_note = _select_best_interim_markdown(
+                    model=model,
+                    timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                    state=intermittent_state,
+                    serena_ctx=serena_ctx,
+                    stop_reason="provider_error",
+                )
+            elif serena_ctx is not None:
                 trace = _build_tool_trace_summary(
                     model=model,
-                    timeout_seconds=timeout_seconds,
-                    tool_calls_made=intermittent_state.tool_calls_so_far if intermittent_state else 0,
+                    timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                    tool_calls_made=len(serena_ctx.used_tools),
                     tools_invoked=serena_ctx.used_tools,
                     memories_used=serena_ctx.used_memories,
                     paths_used=serena_ctx.used_paths,
                 )
-                note = (
-                    f"Reviewer timed out after {timeout_seconds}s with no model-generated review. "
-                    "Returning tool-exploration trace summary as fallback."
-                )
+                if trace.strip():
+                    best_md = trace
+                    best_note = "Returning tool-exploration trace summary as fallback."
+                else:
+                    best_md, best_note = None, "No interim markdown available."
+            else:
+                best_md, best_note = None, "No intermittent state."
+            self._cancel_in_flight_intermittent(intermittent_state)
+
+            if best_md is not None:
+                error_prefix = f"Provider error: {msg}. "
                 return ReviewerOutcome(
                     ok=True,
                     model=model,
                     used_serena=used_serena,
                     serena_disabled_reason=serena_disabled_reason,
-                    serena_activated_project=serena_ctx.activated_project,
-                    serena_used_tools=tuple(sorted(serena_ctx.used_tools)),
-                    serena_used_memories=tuple(sorted(serena_ctx.used_memories)),
-                    serena_used_paths=tuple(sorted(serena_ctx.used_paths)),
-                    markdown=trace,
+                    serena_activated_project=serena_ctx.activated_project if serena_ctx is not None else None,
+                    serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
+                    serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
+                    serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
+                    markdown=best_md,
                     error=None,
-                    provider=provider_used[0],
-                    provider_note=note,
+                    provider=provider_used[0] if provider_used else "openrouter",
+                    provider_note=error_prefix + best_note,
                     is_intermittent=True,
                 )
 
-            msg = f"Reviewer timed out after {timeout_seconds}s"
             return ReviewerOutcome(
                 ok=False,
                 model=model,
@@ -1371,25 +1563,8 @@ class ReviewService:
                 serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
                 markdown=_format_reviewer_error(model, msg),
                 error=msg,
-                provider=provider_used[0],
-                provider_note=provider_notes[0] if provider_notes else None,
-            )
-        except Exception as exc:
-            self._cancel_in_flight_intermittent(intermittent_state)
-            msg = _exc_message(exc)
-            return ReviewerOutcome(
-                ok=False,
-                model=model,
-                used_serena=False,
-                serena_disabled_reason=serena_disabled_reason,
-                serena_activated_project=None,
-                serena_used_tools=(),
-                serena_used_memories=(),
-                serena_used_paths=(),
-                markdown=_format_reviewer_error(model, msg),
-                error=msg,
-                provider=provider_used[0],
-                provider_note=provider_notes[0] if provider_notes else None,
+                provider=provider_used[0] if provider_used else "openrouter",
+                provider_note="; ".join(provider_notes) if provider_notes else None,
             )
 
     async def _tool_loop(
@@ -1617,6 +1792,14 @@ class ReviewService:
                         skipped_preflight_warning_emitted = True
 
                 is_degraded, _reason = _is_degraded_tool_output(tool_out)
+                if intermittent_state is not None:
+                    _update_exploration_digest(
+                        intermittent_state.digest,
+                        fn_name,
+                        fn_args,
+                        tool_out,
+                        is_degraded,
+                    )
                 if is_degraded:
                     degraded_outputs_count += 1
                     consecutive_degraded_outputs += 1
@@ -1632,23 +1815,189 @@ class ReviewService:
 
                 # Intermittent review dispatch (R2/R3): non-blocking; runs concurrent with main loop.
                 if intermittent_state is not None and intermittent_n > 0:
-                    intermittent_state.tool_calls_so_far += 1
-                    if intermittent_state.tool_calls_so_far % intermittent_n == 0:
-                        self._dispatch_intermittent_review(
-                            state=intermittent_state,
-                            model=model,
-                            messages=messages,
-                            use_zai_direct=use_zai_direct,
-                            direct_model_name=direct_model_name,
-                            use_kimi_direct=use_kimi_direct,
-                            direct_kimi_model_name=direct_kimi_model_name,
-                            use_deepseek_direct=use_deepseek_direct,
-                            direct_deepseek_model_name=direct_deepseek_model_name,
-                            use_ollama_direct=use_ollama_direct,
-                            direct_ollama_model_name=direct_ollama_model_name,
-                            extra_body=extra_body,
-                            max_output_tokens=max_output_tokens,
-                        )
+                    if fn_name in PREFLIGHT_TOOL_NAMES and not intermittent_state._preflight_complete:
+                        pass  # Skip dispatch counter for preflight tools
+                    else:
+                        intermittent_state._preflight_complete = True
+                        intermittent_state.tool_calls_so_far += 1
+                        if intermittent_state.tool_calls_so_far % intermittent_n == 0:
+                            self._dispatch_intermittent_review(
+                                state=intermittent_state,
+                                model=model,
+                                messages=messages,
+                                use_zai_direct=use_zai_direct,
+                                direct_model_name=direct_model_name,
+                                use_kimi_direct=use_kimi_direct,
+                                direct_kimi_model_name=direct_kimi_model_name,
+                                use_deepseek_direct=use_deepseek_direct,
+                                direct_deepseek_model_name=direct_deepseek_model_name,
+                                use_ollama_direct=use_ollama_direct,
+                                direct_ollama_model_name=direct_ollama_model_name,
+                                extra_body=extra_body,
+                                max_output_tokens=min(
+                                    self._settings.intermittent_max_output_tokens,
+                                    max_output_tokens,
+                                ),
+                            )
+
+
+def _format_intermittent_status_note(state: IntermittentReviewState) -> str:
+    status = state.last_status
+    error = state.last_error
+    parts = [f"intermittent side-call status: {status}"]
+    if error:
+        parts.append(f"({error})")
+    if state.last_started_at is not None and state.last_finished_at is not None:
+        elapsed = state.last_finished_at - state.last_started_at
+        parts.append(f"[{elapsed:.1f}s elapsed]")
+    return " ".join(parts)
+
+
+def _compute_grace_seconds(
+    *,
+    tool_call_timeout_seconds: int,
+    reviewer_start: float,
+) -> float:
+    remaining = tool_call_timeout_seconds - (time.monotonic() - reviewer_start) - FINAL_RENDER_RESERVE_SECONDS
+    if remaining <= 0:
+        return 0.0
+    return max(1.0, min(remaining, 15.0))
+
+
+def _select_best_interim_markdown(
+    *,
+    model: str,
+    timeout_seconds: int,
+    state: IntermittentReviewState,
+    serena_ctx: "SerenaContext | None",
+    stop_reason: str,
+) -> tuple[str | None, str]:
+    """
+    Priority-based selection of the best available interim markdown.
+
+    Returns (markdown_or_None, provider_note_text).
+    """
+    # 1. Substantive model snapshot
+    if state.latest_markdown and _is_substantive_review_content(state.latest_markdown):
+        note = (
+            f"Returning intermittent snapshot captured at tool call "
+            f"{state.snapshot_tool_call_index}."
+        )
+        return state.latest_markdown, note
+
+    # 2. Deterministic exploration digest (if any tool calls were tracked)
+    if state.digest.total_tool_calls > 0:
+        md = _render_digest_snapshot(
+            model=model,
+            timeout_seconds=timeout_seconds,
+            digest=state.digest,
+            state=state,
+            stop_reason=stop_reason,
+        )
+        status_note = _format_intermittent_status_note(state)
+        note = f"Returning deterministic exploration digest ({status_note})."
+        return md, note
+
+    # 3. Tool-trace summary from Serena context
+    if serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_paths):
+        trace = _build_tool_trace_summary(
+            model=model,
+            timeout_seconds=timeout_seconds,
+            tool_calls_made=state.tool_calls_so_far,
+            tools_invoked=serena_ctx.used_tools,
+            memories_used=serena_ctx.used_memories,
+            paths_used=serena_ctx.used_paths,
+        )
+        note = "Returning tool-exploration trace summary as fallback."
+        return trace, note
+
+    # 4. No evidence at all
+    note = "No interim markdown available."
+    return None, note
+
+
+def _render_digest_snapshot(
+    *,
+    model: str,
+    timeout_seconds: int,
+    digest: ExplorationDigest,
+    state: IntermittentReviewState,
+    stop_reason: str,
+) -> str:
+    files_list = ", ".join(f"`{p}`" for p in sorted(digest.files_read)) if digest.files_read else "*(none)*"
+    tools_list = ", ".join(sorted(digest.tools_invoked)) if digest.tools_invoked else "*(none)*"
+    memories_list = ", ".join(f"`{m}`" for m in sorted(digest.memories_used)) if digest.memories_used else "*(none)*"
+    paths_count = len(digest.paths_visited)
+
+    side_call_status = state.last_status
+    side_call_error = state.last_error
+
+    if stop_reason == "timeout":
+        summary_reason = f"timed out after {timeout_seconds}s"
+    else:
+        summary_reason = f"stopped ({stop_reason})"
+
+    lines: list[str] = []
+    lines.append("## Summary")
+    lines.append(
+        f"Partial review: reviewer (`{model}`) {summary_reason} during tool-assisted exploration.\n"
+        f"Explored **{paths_count} path(s)** across **{digest.total_tool_calls}** tool call(s)."
+    )
+    if side_call_status not in ("never_dispatched", "completed"):
+        note = f"Side-call status: {side_call_status}"
+        if side_call_error:
+            note += f" ({side_call_error})"
+        lines.append(note)
+
+    lines.append("\n## Key Findings")
+    if digest.llm_findings:
+        for finding in digest.llm_findings[:10]:
+            lines.append(f"- {finding}")
+    else:
+        lines.append(f"- **Medium**: Reviewer {summary_reason} before model-generated final analysis.")
+        lines.append(f"- **Info**: Tool exploration inspected {paths_count} path(s) and invoked {len(digest.tools_invoked)} tool type(s).")
+    if digest.degraded_outputs:
+        lines.append(f"- **Low**: {digest.degraded_outputs} degraded tool output(s) encountered during exploration.")
+
+    lines.append("\n## Exploration Statistics")
+    lines.append(f"- **Tool calls made**: {digest.total_tool_calls}")
+    lines.append(f"- **Tools invoked**: {tools_list}")
+    lines.append(f"- **Memories accessed**: {memories_list}")
+    lines.append(f"- **Paths visited**: {paths_count}")
+    if digest.degraded_outputs:
+        lines.append(f"- **Degraded outputs**: {digest.degraded_outputs}")
+
+    lines.append("\n## Files Explored")
+    lines.append(files_list)
+
+    if digest.symbols_found:
+        lines.append("\n## Symbols Found")
+        for sym in digest.symbols_found[:15]:
+            lines.append(f"- `{sym}`")
+
+    if digest.search_matches:
+        lines.append("\n## Search Matches")
+        for match in digest.search_matches[:15]:
+            lines.append(f"- `{match}`")
+
+    lines.append("\n## Recommendations")
+    if digest.llm_recommendations:
+        for rec in digest.llm_recommendations[:10]:
+            lines.append(f"- {rec}")
+    else:
+        lines.append("- Re-run the review with a longer timeout to get a full model-generated review.")
+        lines.append("- Consider reducing the scope (fewer files) to fit within the timeout budget.")
+
+    lines.append("\n## Questions / Unknowns")
+    if digest.llm_open_questions:
+        for q in digest.llm_open_questions[:10]:
+            lines.append(f"- {q}")
+    else:
+        lines.append("- What substantive conclusions would the reviewer have produced after final synthesis?")
+        if side_call_status not in ("never_dispatched", "completed"):
+            lines.append(f"- Did the intermittent side-call fail, time out, or return empty content? (status: {side_call_status})")
+
+    return "\n".join(lines) + "\n"
 
 
 def _format_reviewer_error(model: str, error: str) -> str:

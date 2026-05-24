@@ -83,7 +83,8 @@ class Settings:
     kimi_code_api_key: str | None = None
     deepseek_api_key: str | None = None
     ollama_api_key: str | None = None
-    intermittent_review_calls: int = 5
+    intermittent_review_calls: int = 2
+    intermittent_max_output_tokens: int = 1500
 
     @staticmethod
     def from_env() -> "Settings":
@@ -120,9 +121,11 @@ class Settings:
         tool_call_timeout = _get_int("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS", tool_call_timeout_default)
         if tool_call_timeout <= 0:
             raise ValueError("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > 0")
-        if tool_call_timeout < reviewer_timeout:
+        if tool_call_timeout <= reviewer_timeout:
             raise ValueError(
-                "OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be >= OPENROUTER_REVIEWER_TIMEOUT_SECONDS"
+                "OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > OPENROUTER_REVIEWER_TIMEOUT_SECONDS "
+                "(strictly greater, not equal — equal values risk the reviewer and tool-call "
+                "timeouts firing simultaneously, causing premature reviewer cancellation)."
             )
 
         fixed_output_tokens = _get_int("OPENROUTER_FIXED_OUTPUT_TOKENS", 8192)
@@ -137,9 +140,13 @@ class Settings:
         if max_input_chars <= 0:
             raise ValueError("OPENROUTER_MAX_INPUT_CHARS must be > 0")
 
-        intermittent_review_calls = _get_int("INTERMITTENT_REVIEW_CALLS", 5)
+        intermittent_review_calls = _get_int("INTERMITTENT_REVIEW_CALLS", 2)
         if intermittent_review_calls < 0:
             raise ValueError("INTERMITTENT_REVIEW_CALLS must be >= 0")
+
+        intermittent_max_output_tokens = _get_int("INTERMITTENT_MAX_OUTPUT_TOKENS", 1500)
+        if intermittent_max_output_tokens <= 0:
+            raise ValueError("INTERMITTENT_MAX_OUTPUT_TOKENS must be > 0")
 
         return Settings(
             openrouter_api_key=api_key,
@@ -172,4 +179,5 @@ class Settings:
             deepseek_api_key=_get_str("DEEPSEEK_API_KEY"),
             ollama_api_key=_get_str("OLLAMA_API_KEY"),
             intermittent_review_calls=intermittent_review_calls,
+            intermittent_max_output_tokens=intermittent_max_output_tokens,
         )

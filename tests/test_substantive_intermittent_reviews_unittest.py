@@ -39,7 +39,7 @@ def _build_settings(**overrides) -> Settings:
         zai_coding_plan_key=None,
         kimi_code_api_key=None,
         deepseek_api_key=None,
-        intermittent_review_calls=5,
+        intermittent_review_calls=2,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -51,7 +51,7 @@ def _build_settings(**overrides) -> Settings:
 
 
 class TestProportionalIntermittentTimeout(unittest.TestCase):
-    def test_default_reviewer_timeout_gives_150(self) -> None:
+    def test_default_reviewer_timeout_gives_37(self) -> None:
         settings = _build_settings(openrouter_reviewer_timeout_seconds=300)
         with tempfile.TemporaryDirectory() as td:
             service = ReviewService(
@@ -60,9 +60,9 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 150)
+            self.assertEqual(service._intermittent_timeout, 37)  # min(45, max(20, 300//8))
 
-    def test_short_reviewer_timeout_gives_floor_120(self) -> None:
+    def test_short_reviewer_timeout_gives_floor_20(self) -> None:
         settings = _build_settings(openrouter_reviewer_timeout_seconds=60)
         with tempfile.TemporaryDirectory() as td:
             service = ReviewService(
@@ -71,9 +71,9 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 120)
+            self.assertEqual(service._intermittent_timeout, 20)  # max(20, 60//8=7) = 20
 
-    def test_long_reviewer_timeout_gives_half(self) -> None:
+    def test_long_reviewer_timeout_gives_cap_45(self) -> None:
         settings = _build_settings(openrouter_reviewer_timeout_seconds=600)
         with tempfile.TemporaryDirectory() as td:
             service = ReviewService(
@@ -82,7 +82,7 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 300)
+            self.assertEqual(service._intermittent_timeout, 45)  # min(45, max(20, 600//8=75))
 
 
 # ---------------------------------------------------------------------------

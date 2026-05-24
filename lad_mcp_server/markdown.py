@@ -24,7 +24,7 @@ def normalize_reviewer_markdown(markdown: str) -> str:
 
     # Ensure headings exist (match "## Heading" or "### Heading")
     for section in REQUIRED_SECTIONS:
-        pattern = re.compile(rf"^#{2,3}\s+{re.escape(section)}\s*$", re.MULTILINE)
+        pattern = re.compile(r"^#{2,3}\s+" + re.escape(section) + r"\s*$", re.MULTILINE)
         if pattern.search(normalized) is None:
             normalized += f"\n\n## {section}\n*(No {section} provided by reviewer)*\n"
     return normalized.strip()

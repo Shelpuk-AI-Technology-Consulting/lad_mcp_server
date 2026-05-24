@@ -104,9 +104,10 @@ def intermittent_review_finalize_user_message() -> str:
     there is no need to instruct it to refrain from tool use.
     """
     return (
-        "PARTIAL REVIEW REQUESTED. Based on everything you have explored and gathered so far in this "
-        "conversation, produce your best partial review NOW. Use these markdown sections exactly: "
+        "PARTIAL REVIEW REQUESTED. This is a time-bounded partial review, not a comprehensive one. "
+        "Produce your best concise snapshot NOW using these markdown sections exactly: "
         "`## Summary`, `## Key Findings`, `## Recommendations`, `## Questions / Unknowns`. "
-        "Where you would otherwise have explored further, mark the gap explicitly under "
-        "`## Questions / Unknowns` so the caller knows what is incomplete."
+        "Keep findings to the top 5-10 most important items. "
+        "Under `## Questions / Unknowns`, list areas you have not yet explored. "
+        "Do NOT attempt to be comprehensive — focus on what you can say with confidence right now."
     )

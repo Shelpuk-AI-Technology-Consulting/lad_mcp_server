@@ -37,7 +37,7 @@ def _build_settings(**overrides) -> Settings:
         kimi_code_api_key=None,
         deepseek_api_key=None,
         ollama_api_key=None,
-        intermittent_review_calls=5,
+        intermittent_review_calls=2,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -158,7 +158,7 @@ class TestTimeoutWaitsForInFlightSnapshot(unittest.TestCase):
                 settings = _build_settings(
                     openrouter_reviewer_timeout_seconds=1,
                     openrouter_tool_call_timeout_seconds=2,
-                    intermittent_review_calls=5,
+                    intermittent_review_calls=2,
                 )
                 slow_openrouter = mock.Mock()
 
