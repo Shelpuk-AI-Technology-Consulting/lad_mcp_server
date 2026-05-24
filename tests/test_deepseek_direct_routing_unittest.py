@@ -478,5 +478,127 @@ class TestDeepSeekThinkingMode(unittest.TestCase):
         self.assertEqual(sdk.calls[0].get("extra_body"), {"thinking": {"type": "enabled"}})
 
 
+class TestOpenRouterOnlyKeysFiltering(unittest.TestCase):
+    """Verify that _call_model_with_provider_fallback strips OpenRouter-only
+    keys from extra_body before forwarding to direct providers."""
+
+    def _build_service(self, *, deepseek_key: str = "test-ds-key") -> tuple[ReviewService, _RecordingSDKClient]:
+        with tempfile.TemporaryDirectory() as td:
+            settings = Settings(
+                openrouter_api_key="test-or",
+                openrouter_primary_reviewer_model="deepseek/deepseek-v4-flash",
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=30,
+                openrouter_tool_call_timeout_seconds=30,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=4,
+                lad_serena_tool_timeout_seconds=2,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+                deepseek_api_key=deepseek_key,
+            )
+            ds_client = DeepSeekClient(api_key=deepseek_key, max_concurrent_requests=2)
+            sdk = _RecordingSDKClient(_FakeMessage(content="## Summary\nReview complete with findings."))
+            _install_sdk_client(ds_client, sdk)
+            models_mock = mock.Mock()
+            models_mock.get_model.return_value = ModelMetadata(
+                model_id="deepseek/deepseek-v4-flash",
+                context_length=50000,
+                supported_parameters=("tools", "tool_choice", "max_tokens"),
+                provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+            )
+            service = ReviewService(
+                repo_root=Path(td),
+                settings=settings,
+                openrouter_client=mock.Mock(),
+                models_client=models_mock,
+                deepseek_client=ds_client,
+            )
+            return service, sdk
+
+    def test_include_reasoning_stripped_from_direct_call(self) -> None:
+        service, sdk = self._build_service()
+        provider_used = ["openrouter"]
+        provider_notes: list[str] = []
+        asyncio.run(service._call_model_with_provider_fallback(
+            model="deepseek/deepseek-v4-flash",
+            direct_model_name=None,
+            use_zai_direct=False,
+            direct_kimi_model_name=None,
+            use_kimi_direct=False,
+            direct_deepseek_model_name="deepseek-v4-flash",
+            use_deepseek_direct=True,
+            messages=[{"role": "user", "content": "review this"}],
+            timeout_seconds=10,
+            max_output_tokens=100,
+            tools=None,
+            preferred_tool_choice=None,
+            extra_body={"include_reasoning": True, "max_completion_tokens": 2000},
+            provider_used=provider_used,
+            provider_notes=provider_notes,
+        ))
+        self.assertEqual(provider_used[0], "deepseek")
+        sent_extra_body = sdk.calls[0].get("extra_body")
+        self.assertNotIn("include_reasoning", sent_extra_body or {})
+        self.assertNotIn("max_completion_tokens", sent_extra_body or {})
+
+    def test_non_openrouter_keys_preserved(self) -> None:
+        service, sdk = self._build_service()
+        provider_used = ["openrouter"]
+        provider_notes: list[str] = []
+        asyncio.run(service._call_model_with_provider_fallback(
+            model="deepseek/deepseek-v4-flash",
+            direct_model_name=None,
+            use_zai_direct=False,
+            direct_kimi_model_name=None,
+            use_kimi_direct=False,
+            direct_deepseek_model_name="deepseek-v4-flash",
+            use_deepseek_direct=True,
+            messages=[{"role": "user", "content": "review this"}],
+            timeout_seconds=10,
+            max_output_tokens=100,
+            tools=None,
+            preferred_tool_choice=None,
+            extra_body={"thinking": {"type": "enabled"}},
+            provider_used=provider_used,
+            provider_notes=provider_notes,
+        ))
+        self.assertEqual(provider_used[0], "deepseek")
+        sent_extra_body = sdk.calls[0].get("extra_body")
+        self.assertEqual(sent_extra_body, {"thinking": {"type": "enabled"}})
+
+    def test_none_extra_body_stays_none(self) -> None:
+        service, sdk = self._build_service()
+        provider_used = ["openrouter"]
+        provider_notes: list[str] = []
+        asyncio.run(service._call_model_with_provider_fallback(
+            model="deepseek/deepseek-v4-flash",
+            direct_model_name=None,
+            use_zai_direct=False,
+            direct_kimi_model_name=None,
+            use_kimi_direct=False,
+            direct_deepseek_model_name="deepseek-v4-flash",
+            use_deepseek_direct=True,
+            messages=[{"role": "user", "content": "review this"}],
+            timeout_seconds=10,
+            max_output_tokens=100,
+            tools=None,
+            preferred_tool_choice=None,
+            extra_body=None,
+            provider_used=provider_used,
+            provider_notes=provider_notes,
+        ))
+        self.assertEqual(provider_used[0], "deepseek")
+
+
 if __name__ == "__main__":
     unittest.main()

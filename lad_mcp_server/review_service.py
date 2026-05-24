@@ -62,6 +62,9 @@ PREFLIGHT_TOOL_NAMES = frozenset(
 
 EXPLORATION_DIGEST_MAX_SNIPPET_CHARS = 200
 
+# Keys that are OpenRouter-specific and must not be forwarded to direct providers.
+_OPENROUTER_ONLY_KEYS = frozenset({"include_reasoning", "max_completion_tokens"})
+
 _SUBSTANTIVE_PLACEHOLDER_RE = re.compile(
     r"^\*\([^)]+\)\*$|"  # *(No Summary provided by reviewer)*
     r"^#{1,4}\s+.+$",     # markdown section headers
@@ -650,6 +653,12 @@ class ReviewService:
         provider_used: list[str],
         provider_notes: list[str],
     ) -> OpenRouterCallResult:
+        direct_extra_body = (
+            {k: v for k, v in extra_body.items() if k not in _OPENROUTER_ONLY_KEYS}
+            if extra_body
+            else None
+        )
+
         if use_deepseek_direct and self._deepseek is not None and direct_deepseek_model_name:
             try:
                 result = await self._deepseek.chat_completion(
@@ -659,7 +668,7 @@ class ReviewService:
                     max_output_tokens=max_output_tokens,
                     tools=tools,
                     tool_choice=preferred_tool_choice,
-                    extra_body=extra_body,
+                    extra_body=direct_extra_body,
                 )
                 provider_used[:] = ["deepseek"]
                 return result
@@ -678,7 +687,7 @@ class ReviewService:
                     max_output_tokens=max_output_tokens,
                     tools=tools,
                     tool_choice=preferred_tool_choice,
-                    extra_body=extra_body,
+                    extra_body=direct_extra_body,
                 )
                 provider_used[:] = ["ollama"]
                 return result
@@ -697,7 +706,7 @@ class ReviewService:
                     max_output_tokens=max_output_tokens,
                     tools=tools,
                     tool_choice=preferred_tool_choice,
-                    extra_body=extra_body,
+                    extra_body=direct_extra_body,
                 )
                 provider_used[:] = ["zai_coding_plan"]
                 return result
@@ -717,7 +726,7 @@ class ReviewService:
                         max_output_tokens=max_output_tokens,
                         tools=tools,
                         tool_choice=preferred_tool_choice,
-                        extra_body=extra_body,
+                        extra_body=direct_extra_body,
                     )
                     provider_used[:] = ["kimi_code"]
                     return result
@@ -1203,6 +1212,13 @@ class ReviewService:
             and is_deepseek_model(model)
         )
         direct_deepseek_model_name = normalize_deepseek_model_name(model) if use_deepseek_direct else None
+        if is_deepseek_model(model) and not use_deepseek_direct:
+            log.warning(
+                "DeepSeek model '%s' not routed direct: api_key=%s, client=%s",
+                model,
+                bool(self._settings.deepseek_api_key),
+                self._deepseek is not None,
+            )
 
         use_ollama_direct = (
             bool(self._settings.ollama_api_key)
@@ -1409,6 +1425,7 @@ class ReviewService:
             # If the model completed but returned empty or placeholder-only content,
             # fall back to the best available interim evidence (digest/trace) instead
             # of returning useless placeholder stubs.
+            is_intermittent = False
             if not _is_substantive_review_content(markdown):
                 if intermittent_state is not None:
                     best_md, best_note = _select_best_interim_markdown(
@@ -1420,6 +1437,7 @@ class ReviewService:
                     )
                     if best_md is not None:
                         markdown = best_md
+                        is_intermittent = True
                         provider_notes.append(
                             f"Reviewer completed with empty content. {best_note}"
                         )
@@ -1427,13 +1445,14 @@ class ReviewService:
                     trace = _build_tool_trace_summary(
                         model=model,
                         timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
-                        tool_calls_made=len(serena_ctx.used_tools),
+                        tool_calls_made=serena_ctx.total_tool_calls,
                         tools_invoked=serena_ctx.used_tools,
                         memories_used=serena_ctx.used_memories,
                         paths_used=serena_ctx.used_paths,
                     )
                     if trace.strip():
                         markdown = trace
+                        is_intermittent = True
                         provider_notes.append(
                             "Reviewer completed with empty content. Returning tool-exploration trace summary as fallback."
                         )
@@ -1450,7 +1469,8 @@ class ReviewService:
                 markdown=markdown,
                 error=None,
                 provider=provider_used[0],
-                provider_note=provider_notes[0] if provider_notes else None,
+                provider_note="; ".join(provider_notes) if provider_notes else None,
+                is_intermittent=is_intermittent,
             )
         except (TimeoutError, asyncio.TimeoutError):
             timeout_seconds = self._settings.openrouter_reviewer_timeout_seconds
@@ -1484,7 +1504,7 @@ class ReviewService:
                 trace = _build_tool_trace_summary(
                     model=model,
                     timeout_seconds=timeout_seconds,
-                    tool_calls_made=len(serena_ctx.used_tools),
+                    tool_calls_made=serena_ctx.total_tool_calls,
                     tools_invoked=serena_ctx.used_tools,
                     memories_used=serena_ctx.used_memories,
                     paths_used=serena_ctx.used_paths,
@@ -1531,7 +1551,7 @@ class ReviewService:
                 markdown=_format_reviewer_error(model, f"Reviewer timed out after {timeout_seconds}s"),
                 error=f"Reviewer timed out after {timeout_seconds}s",
                 provider=provider_used[0],
-                provider_note=provider_notes[0] if provider_notes else None,
+                provider_note="; ".join(provider_notes) if provider_notes else None,
             )
         except Exception as exc:
             msg = _exc_message(exc)
@@ -1553,7 +1573,7 @@ class ReviewService:
                 trace = _build_tool_trace_summary(
                     model=model,
                     timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
-                    tool_calls_made=len(serena_ctx.used_tools),
+                    tool_calls_made=serena_ctx.total_tool_calls,
                     tools_invoked=serena_ctx.used_tools,
                     memories_used=serena_ctx.used_memories,
                     paths_used=serena_ctx.used_paths,
@@ -1936,7 +1956,7 @@ def _select_best_interim_markdown(
         trace = _build_tool_trace_summary(
             model=model,
             timeout_seconds=timeout_seconds,
-            tool_calls_made=state.tool_calls_so_far,
+            tool_calls_made=serena_ctx.total_tool_calls,
             tools_invoked=serena_ctx.used_tools,
             memories_used=serena_ctx.used_memories,
             paths_used=serena_ctx.used_paths,
