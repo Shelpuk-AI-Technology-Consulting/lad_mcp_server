@@ -44,7 +44,7 @@ class _OpenRouterStub:
                 "tools": tools,
             }
         )
-        return type("R", (), {"content": "## Summary\nOpenRouter OK", "tool_calls": [], "raw": {}})()
+        return type("R", (), {"content": "## Summary\nOpenRouter OK — review completed successfully.", "tool_calls": [], "raw": {}})()
 
 
 class _ZaiStub:
@@ -72,7 +72,7 @@ class _ZaiStub:
         )
         if self.fail:
             raise RuntimeError("zai endpoint unavailable")
-        return type("R", (), {"content": "## Summary\nZAI OK", "tool_calls": [], "raw": {}})()
+        return type("R", (), {"content": "## Summary\nZAI OK — review completed successfully.", "tool_calls": [], "raw": {}})()
 
 
 class TestZaiRouting(unittest.TestCase):

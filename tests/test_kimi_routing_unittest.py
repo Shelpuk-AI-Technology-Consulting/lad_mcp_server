@@ -44,7 +44,7 @@ class _OpenRouterStub:
                 "tools": tools,
             }
         )
-        return type("R", (), {"content": "## Summary\nOpenRouter OK", "tool_calls": [], "raw": {}})()
+        return type("R", (), {"content": "## Summary\nOpenRouter OK — review completed successfully.", "tool_calls": [], "raw": {}})()
 
 
 class _KimiStub:

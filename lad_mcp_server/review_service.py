@@ -1409,19 +1409,33 @@ class ReviewService:
             # If the model completed but returned empty or placeholder-only content,
             # fall back to the best available interim evidence (digest/trace) instead
             # of returning useless placeholder stubs.
-            if not _is_substantive_review_content(markdown) and intermittent_state is not None:
-                best_md, best_note = _select_best_interim_markdown(
-                    model=model,
-                    timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
-                    state=intermittent_state,
-                    serena_ctx=serena_ctx,
-                    stop_reason="empty_content",
-                )
-                if best_md is not None:
-                    markdown = best_md
-                    if provider_notes:
-                        provider_notes[0] = (
+            if not _is_substantive_review_content(markdown):
+                if intermittent_state is not None:
+                    best_md, best_note = _select_best_interim_markdown(
+                        model=model,
+                        timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                        state=intermittent_state,
+                        serena_ctx=serena_ctx,
+                        stop_reason="empty_content",
+                    )
+                    if best_md is not None:
+                        markdown = best_md
+                        provider_notes.append(
                             f"Reviewer completed with empty content. {best_note}"
+                        )
+                if not _is_substantive_review_content(markdown) and serena_ctx is not None:
+                    trace = _build_tool_trace_summary(
+                        model=model,
+                        timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                        tool_calls_made=len(serena_ctx.used_tools),
+                        tools_invoked=serena_ctx.used_tools,
+                        memories_used=serena_ctx.used_memories,
+                        paths_used=serena_ctx.used_paths,
+                    )
+                    if trace.strip():
+                        markdown = trace
+                        provider_notes.append(
+                            "Reviewer completed with empty content. Returning tool-exploration trace summary as fallback."
                         )
 
             return ReviewerOutcome(
