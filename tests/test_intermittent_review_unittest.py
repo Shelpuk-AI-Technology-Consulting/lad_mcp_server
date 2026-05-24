@@ -1863,6 +1863,153 @@ class TestRegressionDigestNoFullFileContents(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Success-path empty-content fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSuccessPathEmptyContentFallback(unittest.TestCase):
+    """When _tool_loop completes with empty/placeholder content, the success
+    path should fall back to digest/trace instead of returning placeholder stubs."""
+
+    def test_empty_final_content_returns_digest(self) -> None:
+        """Reviewer completes with empty content after tool exploration → digest fallback."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                # Model does tool calls then returns empty string
+                client = _MainOnlyClient(main_responses=[
+                    # Turn 1: tool call
+                    OpenRouterCallResult(
+                        content="",
+                        tool_calls=[{"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.py\"}"}}],
+                        raw={},
+                    ),
+                    # Turn 2: empty final content (model exhausted output tokens on reasoning)
+                    OpenRouterCallResult(
+                        content="",
+                        tool_calls=[],
+                        raw={},
+                    ),
+                    # Turn 3: retry also empty
+                    OpenRouterCallResult(
+                        content="   ",
+                        tool_calls=[],
+                        raw={},
+                    ),
+                ])
+                settings = _build_settings(intermittent_n=1)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                outcome = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                self.assertTrue(outcome.ok, "Should return ok=True with digest fallback")
+                self.assertNotIn("*(No Summary provided by reviewer)*", outcome.markdown)
+                self.assertNotIn("*(No Key Findings provided by reviewer)*", outcome.markdown)
+                # Should contain evidence from the tool call
+                self.assertIn("src/main.py", outcome.markdown)
+
+        asyncio.run(scenario())
+
+    def test_placeholder_only_content_returns_digest(self) -> None:
+        """Reviewer completes with placeholder-only content → digest fallback."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                client = _MainOnlyClient(main_responses=[
+                    OpenRouterCallResult(
+                        content="",
+                        tool_calls=[{"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/app.py\"}"}}],
+                        raw={},
+                    ),
+                    OpenRouterCallResult(
+                        content="## Summary\n*(No Summary provided by reviewer)*",
+                        tool_calls=[],
+                        raw={},
+                    ),
+                ])
+                settings = _build_settings(intermittent_n=1)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                outcome = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                self.assertTrue(outcome.ok)
+                self.assertNotIn("*(No Summary provided by reviewer)*", outcome.markdown)
+                self.assertIn("src/app.py", outcome.markdown)
+
+        asyncio.run(scenario())
+
+    def test_substantive_content_is_returned_as_is(self) -> None:
+        """Reviewer completes with real content → no fallback, return as-is."""
+        async def scenario():
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / ".serena" / "memories").mkdir(parents=True)
+
+                client = _MainOnlyClient(main_responses=[
+                    OpenRouterCallResult(
+                        content="",
+                        tool_calls=[{"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.py\"}"}}],
+                        raw={},
+                    ),
+                    OpenRouterCallResult(
+                        content="## Summary\nFound 3 bugs.\n## Key Findings\n- Bug A\n## Recommendations\n- Fix A\n## Questions / Unknowns\n- Is this safe?",
+                        tool_calls=[],
+                        raw={},
+                    ),
+                ])
+                settings = _build_settings(intermittent_n=1)
+                service = ReviewService(
+                    repo_root=repo,
+                    settings=settings,
+                    openrouter_client=client,
+                    models_client=_ModelsStub("test/model"),
+                )
+                cfg = service._prepare_reviewer_config("test/model", repo_root=repo)
+                outcome = await service._run_single_reviewer(
+                    cfg=cfg,
+                    tool_name="code_review",
+                    build_system_prompt=lambda tool_calling_enabled: "system",
+                    build_user_prompt=lambda *a, **kw: "user prompt",
+                    redacted_inputs={"code": "hello"},
+                    requested_paths=None,
+                    file_context_builder=_DummyFCB(),
+                )
+                self.assertTrue(outcome.ok)
+                self.assertIn("Found 3 bugs", outcome.markdown)
+                self.assertNotIn("src/main.py", outcome.markdown)
+
+        asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 

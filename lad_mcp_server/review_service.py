@@ -1405,6 +1405,25 @@ class ReviewService:
             used_serena = serena_ctx is not None and (
                 serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths
             )
+
+            # If the model completed but returned empty or placeholder-only content,
+            # fall back to the best available interim evidence (digest/trace) instead
+            # of returning useless placeholder stubs.
+            if not _is_substantive_review_content(markdown) and intermittent_state is not None:
+                best_md, best_note = _select_best_interim_markdown(
+                    model=model,
+                    timeout_seconds=self._settings.openrouter_reviewer_timeout_seconds,
+                    state=intermittent_state,
+                    serena_ctx=serena_ctx,
+                    stop_reason="empty_content",
+                )
+                if best_md is not None:
+                    markdown = best_md
+                    if provider_notes:
+                        provider_notes[0] = (
+                            f"Reviewer completed with empty content. {best_note}"
+                        )
+
             return ReviewerOutcome(
                 ok=True,
                 model=model,
