@@ -1,6 +1,11 @@
 import unittest
 
-from lad_mcp_server.prompts import force_finalize_system_message, system_prompt_code_review, system_prompt_system_design_review
+from lad_mcp_server.prompts import (
+    force_finalize_system_message,
+    intermittent_review_finalize_user_message,
+    system_prompt_code_review,
+    system_prompt_system_design_review,
+)
 
 
 class TestPrompts(unittest.TestCase):
@@ -46,6 +51,17 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("improvement opportunities", p)
         self.assertIn("Do not summarize which tools", p)
         self.assertIn("## Key Findings", p)
+
+    def test_intermittent_review_prompt_requests_bounded_partial_snapshot(self) -> None:
+        p = intermittent_review_finalize_user_message()
+        self.assertIn("time-bounded partial review", p)
+        self.assertIn("concise snapshot", p)
+        self.assertIn("top 5-10", p)
+        self.assertIn("not yet explored", p)
+        self.assertIn("## Summary", p)
+        self.assertIn("## Key Findings", p)
+        self.assertIn("## Recommendations", p)
+        self.assertIn("## Questions / Unknowns", p)
 
 
 if __name__ == "__main__":

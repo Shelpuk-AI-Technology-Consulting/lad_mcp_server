@@ -104,3 +104,21 @@ def force_finalize_system_message() -> str:
         "## Recommendations\n"
         "## Questions / Unknowns\n"
     )
+
+
+def intermittent_review_finalize_user_message() -> str:
+    """
+    User-role nudge for an intermittent (partial) review snapshot.
+
+    Sent as a user message (not system) to avoid provider quirks with mid-chain system messages.
+    The side call is dispatched with `tools=None`, so the model has no tools available to call —
+    there is no need to instruct it to refrain from tool use.
+    """
+    return (
+        "PARTIAL REVIEW REQUESTED. This is a time-bounded partial review, not a comprehensive one. "
+        "Produce your best concise snapshot NOW using these markdown sections exactly: "
+        "`## Summary`, `## Key Findings`, `## Recommendations`, `## Questions / Unknowns`. "
+        "Keep findings to the top 5-10 most important items. "
+        "Under `## Questions / Unknowns`, list areas you have not yet explored. "
+        "Do NOT attempt to be comprehensive — focus on what you can say with confidence right now."
+    )

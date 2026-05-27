@@ -4,81 +4,48 @@ import asyncio
 import atexit
 import json
 import threading
+import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from lad_mcp_server.openrouter_client import OpenRouterCallResult, extract_reasoning_content, strip_reasoning_content
 
-class OpenRouterClientError(RuntimeError):
+
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+_KIMI_DIRECT_MODEL = "kimi-for-coding"
+
+
+class KimiCodeClientError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class OpenRouterCallResult:
+def is_kimi_model(model: str) -> bool:
+    if not isinstance(model, str):
+        return False
+    normalized = model.strip().lower()
+    return normalized == "kimi-for-coding" or normalized.startswith("moonshotai/")
+
+
+def normalize_kimi_model_name(model: str) -> str:
+    """Translate the OpenRouter model name to the Kimi Code direct-endpoint model name.
+
+    The Kimi Code coding endpoint uses a single fixed model identifier
+    (``kimi-for-coding``) regardless of which OpenRouter-style variant was
+    requested, so this function always returns that constant.
     """
-    Normalized view of a chat completion response.
-
-    We normalize only what this project needs: assistant content + tool calls (if any) +
-    reasoning_content (when the model produced hidden reasoning tokens — e.g., GLM-5).
-    """
-
-    content: str | None
-    tool_calls: list[dict[str, Any]]
-    raw: Any
-    reasoning_content: str | None = None
-
-
-def extract_reasoning_content(msg: Any) -> str | None:
-    """
-    Extract `reasoning_content` from a response message.
-
-    Handles three message shapes:
-    - dict (stdlib HTTP path, OpenRouter raw, test fakes)
-    - Pydantic-style SDK object with direct attribute access
-    - Pydantic SDK object where the field lives in `model_extra` (when not in the type definition)
-    """
-    if isinstance(msg, dict):
-        v = msg.get("reasoning_content")
-    else:
-        v = getattr(msg, "reasoning_content", None)
-        if v is None:
-            extra = getattr(msg, "model_extra", None) or {}
-            if isinstance(extra, dict):
-                v = extra.get("reasoning_content")
-    return v if isinstance(v, str) and v != "" else None
-
-
-def strip_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Return a copy of `messages` where every entry has its `reasoning_content` key removed.
-
-    Z.AI Coding Plan requires assistant messages to carry the full prior `reasoning_content`
-    across tool-call rounds (Preserved Thinking). Other providers (OpenRouter, Moonshot) may
-    reject the unknown key with a 4xx — so we strip before forwarding to them.
-
-    Does not mutate the input list/entries.
-    """
-    out: list[dict[str, Any]] = []
-    for m in messages:
-        if isinstance(m, dict) and "reasoning_content" in m:
-            out.append({k: v for k, v in m.items() if k != "reasoning_content"})
-        else:
-            out.append(m)
-    return out
+    return _KIMI_DIRECT_MODEL
 
 
 def _normalize_tool_calls(tool_calls_obj: Any) -> list[dict[str, Any]]:
     if tool_calls_obj is None:
         return []
     if isinstance(tool_calls_obj, list):
-        # Could already be list[dict], or list of typed objects.
         normalized: list[dict[str, Any]] = []
         for tc in tool_calls_obj:
             if isinstance(tc, dict):
                 normalized.append(tc)
             else:
-                # Best-effort attribute extraction.
                 normalized.append(
                     {
                         "id": getattr(tc, "id", None),
@@ -93,24 +60,16 @@ def _normalize_tool_calls(tool_calls_obj: Any) -> list[dict[str, Any]]:
     return []
 
 
-class OpenRouterClient:
+class KimiCodeClient:
     def __init__(
         self,
         *,
         api_key: str,
-        http_referer: str | None,
-        x_title: str | None,
         max_concurrent_requests: int,
+        base_url: str = KIMI_CODE_BASE_URL,
     ) -> None:
         self._api_key = api_key
-        self._default_headers: dict[str, str] = {"User-Agent": "claude-code/1.0"}
-        if http_referer:
-            self._default_headers["HTTP-Referer"] = http_referer
-        if x_title:
-            self._default_headers["X-Title"] = x_title
-        # NOTE: asyncio synchronization primitives can be event-loop bound (notably in newer Python versions).
-        # This client is typically constructed outside of an active event loop (e.g., at FastMCP app startup),
-        # so we must initialize loop-bound primitives lazily when `chat_completion()` runs.
+        self._base_url = base_url.rstrip("/")
         self._max_concurrent_requests = max_concurrent_requests
         self._semaphore: asyncio.Semaphore | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
@@ -136,19 +95,12 @@ class OpenRouterClient:
             return self._semaphore
 
     def close(self) -> None:
-        """
-        Best-effort cleanup for background resources (ThreadPoolExecutor).
-
-        The MCP server typically runs as a long-lived process; without closing, the executor can
-        leak threads across reloads/tests. `atexit` also calls this method.
-        """
         if self._closed:
             return
         self._closed = True
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # Python <3.9 compatibility (cancel_futures not supported).
             self._executor.shutdown(wait=False)
 
     def _get_client(self) -> Any:
@@ -159,16 +111,14 @@ class OpenRouterClient:
                 return self._client
             try:
                 from openai import AsyncOpenAI
-            except Exception:  # pragma: no cover
-                # Fall back to stdlib HTTP client when `openai` isn't installed. This is primarily for
-                # environments where installing packages is unavailable.
+            except Exception:
                 self._client = "stdlib"
                 return self._client
 
             self._client = AsyncOpenAI(
-                base_url="https://openrouter.ai/api/v1",
+                base_url=self._base_url,
                 api_key=self._api_key,
-                default_headers=self._default_headers or None,
+                default_headers={"User-Agent": "claude-code/1.0"},
             )
             return self._client
 
@@ -187,10 +137,11 @@ class OpenRouterClient:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "claude-code/1.0",
         }
-        headers.update(self._default_headers)
 
-        # OpenRouter does not accept `reasoning_content` on assistant messages; strip before sending.
+        # Kimi Code endpoint does not document `reasoning_content` support — strip it from outgoing
+        # messages to avoid 4xx schema rejections.
         sanitized_messages = strip_reasoning_content(messages)
 
         body: dict[str, Any] = {
@@ -206,7 +157,7 @@ class OpenRouterClient:
             body.update(extra_body)
 
         req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
+            f"{self._base_url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -216,16 +167,24 @@ class OpenRouterClient:
             try:
                 with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                     raw = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                try:
+                    body_text = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body_text = ""
+                raise KimiCodeClientError(
+                    f"Kimi Code endpoint HTTP {getattr(exc, 'code', 'error')}: {body_text[:300]}"
+                ) from exc
             except Exception as exc:
-                raise OpenRouterClientError(f"OpenRouter request failed: {exc}") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request failed: {exc}") from exc
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise OpenRouterClientError("OpenRouter response was not valid JSON") from exc
+                raise KimiCodeClientError("Kimi Code endpoint response was not valid JSON") from exc
             if not isinstance(parsed, dict):
-                raise OpenRouterClientError("OpenRouter response JSON was not an object")
+                raise KimiCodeClientError("Kimi Code endpoint response JSON was not an object")
             if "error" in parsed:
-                raise OpenRouterClientError(f"OpenRouter error: {parsed.get('error')}")
+                raise KimiCodeClientError(f"Kimi Code endpoint error: {parsed.get('error')}")
             return parsed
 
         loop = asyncio.get_running_loop()
@@ -260,9 +219,6 @@ class OpenRouterClient:
         tool_choice: str | dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> OpenRouterCallResult:
-        """
-        Call OpenRouter via OpenAI-compatible chat completions.
-        """
         client = self._get_client()
 
         async with self._get_semaphore():
@@ -277,13 +233,8 @@ class OpenRouterClient:
                     extra_body=extra_body,
                 )
 
-            # Strip `reasoning_content` from outgoing messages — OpenRouter / upstream providers
-            # do not accept the field on assistant messages and may return 4xx if it's present.
             sanitized_messages = strip_reasoning_content(messages)
             try:
-                # `timeout=` on the SDK call ensures the underlying httpx idle/read timeout matches
-                # our wait_for budget; without it, reasoning models can trigger a spurious early
-                # APITimeoutError between reasoning tokens.
                 response = await asyncio.wait_for(
                     client.chat.completions.create(
                         model=model,
@@ -297,11 +248,10 @@ class OpenRouterClient:
                     timeout=timeout_seconds,
                 )
             except asyncio.TimeoutError as exc:
-                raise OpenRouterClientError(f"OpenRouter request timed out after {timeout_seconds}s") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request timed out after {timeout_seconds}s") from exc
             except Exception as exc:
-                raise OpenRouterClientError(f"OpenRouter request failed: {exc}") from exc
+                raise KimiCodeClientError(f"Kimi Code endpoint request failed: {exc}") from exc
 
-        # Normalize
         try:
             choice0 = response.choices[0]
             msg = choice0.message

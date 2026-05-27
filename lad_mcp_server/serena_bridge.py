@@ -57,6 +57,7 @@ class SerenaContext:
 
         self._total_chars_emitted = 0
         self.used_tools: set[str] = set()
+        self.total_tool_calls: int = 0
         self.used_memories: set[str] = set()
         self.used_paths: set[str] = set()
         self.activated_project: str | None = None
@@ -272,6 +273,7 @@ class SerenaContext:
 
         Output is redacted and capped to configured budgets.
         """
+        self.total_tool_calls += 1
         try:
             args = json.loads(arguments_json) if arguments_json else {}
         except json.JSONDecodeError as exc:
