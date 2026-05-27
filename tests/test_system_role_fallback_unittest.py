@@ -41,6 +41,7 @@ def _make_settings(**overrides) -> Settings:
         lad_serena_max_total_chars=50000,
         lad_serena_max_dir_entries=100,
         lad_serena_max_search_results=20,
+        zai_coding_plan_key=None,
     )
     defaults.update(overrides)
     return Settings(**defaults)
