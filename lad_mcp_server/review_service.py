@@ -37,6 +37,8 @@ CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for mixed tokenizers
 OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS = 5  # avoid racing external tool-call deadlines
 TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
+SYSTEM_ROLE_FALLBACK_TTL_SECONDS = 3600
+SYSTEM_ROLE_FALLBACK_CACHE_MAX_MODELS = 128
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -217,6 +219,8 @@ class ReviewService:
         self._tool_executor = _TOOL_EXECUTOR
         self._tool_choice_fallback_until_by_model: dict[str, float] = {}
         self._tool_choice_fallback_lock = threading.Lock()
+        self._system_role_fallback_until_by_model: dict[str, float] = {}
+        self._system_role_fallback_lock = threading.Lock()
 
     @staticmethod
     def _tool_choice_model_key(model: str) -> str:
@@ -269,6 +273,68 @@ class ReviewService:
         )
 
     @staticmethod
+    def _system_role_model_key(model: str) -> str:
+        return model.strip()
+
+    def _is_system_role_fallback_active(self, model: str) -> bool:
+        key = self._system_role_model_key(model)
+        now = time.monotonic()
+        with self._system_role_fallback_lock:
+            expires_at = self._system_role_fallback_until_by_model.get(key)
+            if expires_at is None:
+                self._cleanup_system_role_fallback_cache_locked(now)
+                return False
+            if expires_at <= now:
+                self._system_role_fallback_until_by_model.pop(key, None)
+                self._cleanup_system_role_fallback_cache_locked(now)
+                return False
+            self._cleanup_system_role_fallback_cache_locked(now)
+            return True
+
+    def _remember_system_role_fallback(self, model: str) -> None:
+        key = self._system_role_model_key(model)
+        now = time.monotonic()
+        with self._system_role_fallback_lock:
+            already_active = (self._system_role_fallback_until_by_model.get(key) or 0.0) > now
+            self._system_role_fallback_until_by_model[key] = now + float(SYSTEM_ROLE_FALLBACK_TTL_SECONDS)
+            self._cleanup_system_role_fallback_cache_locked(now)
+        if not already_active:
+            log.info("System-role fallback cache activated for model '%s' (%ss)", key, SYSTEM_ROLE_FALLBACK_TTL_SECONDS)
+
+    def _cleanup_system_role_fallback_cache_locked(self, now: float) -> None:
+        expired = [k for k, v in self._system_role_fallback_until_by_model.items() if v <= now]
+        for k in expired:
+            self._system_role_fallback_until_by_model.pop(k, None)
+        while len(self._system_role_fallback_until_by_model) > SYSTEM_ROLE_FALLBACK_CACHE_MAX_MODELS:
+            oldest_key = min(
+                self._system_role_fallback_until_by_model,
+                key=self._system_role_fallback_until_by_model.get,
+            )
+            self._system_role_fallback_until_by_model.pop(oldest_key, None)
+
+    @staticmethod
+    def _is_retryable_system_role_error(exc: OpenRouterClientError) -> bool:
+        msg = _exc_message(exc).lower()
+        return (
+            "invalid message role: system" in msg
+            or "invalid params, chat content has invalid message role" in msg and "system" in msg
+            or "role: system" in msg and "invalid" in msg
+        )
+
+    def _adapt_messages_for_model(self, model: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self._is_system_role_fallback_active(model):
+            return messages
+        adapted: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                new_msg = dict(msg)
+                new_msg["role"] = "user"
+                adapted.append(new_msg)
+            else:
+                adapted.append(msg)
+        return adapted
+
+    @staticmethod
     def _build_tool_choice_attempts(
         *,
         tools: list[dict[str, Any]] | None,
@@ -301,7 +367,7 @@ class ReviewService:
             try:
                 return await self._openrouter.chat_completion(
                     model=model,
-                    messages=messages,
+                    messages=self._adapt_messages_for_model(model, messages),
                     timeout_seconds=timeout_seconds,
                     max_output_tokens=max_output_tokens,
                     tools=tools,
@@ -310,12 +376,27 @@ class ReviewService:
                 )
             except OpenRouterClientError as exc:
                 last_exc = exc
+                if self._is_retryable_system_role_error(exc):
+                    self._remember_system_role_fallback(model)
+                    try:
+                        return await self._openrouter.chat_completion(
+                            model=model,
+                            messages=self._adapt_messages_for_model(model, messages),
+                            timeout_seconds=timeout_seconds,
+                            max_output_tokens=max_output_tokens,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            extra_body=extra_body,
+                        )
+                    except OpenRouterClientError as retry_exc:
+                        last_exc = retry_exc
+                        exc = retry_exc
                 if not tools or not self._is_retryable_tool_choice_compatibility_error(exc):
-                    raise
+                    raise exc
                 if tool_choice is not None:
                     self._remember_tool_choice_fallback(model)
                 if idx == len(attempts) - 1:
-                    raise
+                    raise exc
                 log.info(
                     "Retrying OpenRouter call for model '%s' with fallback tool_choice=%r",
                     model,
@@ -738,16 +819,28 @@ class ReviewService:
             # `TimeoutError` stringifies to an empty message; wrap it into an actionable error.
             msg = f"Reviewer timed out after {self._settings.openrouter_reviewer_timeout_seconds}s"
             used_serena = serena_ctx is not None and (serena_ctx.used_tools or serena_ctx.used_memories or serena_ctx.used_paths)
+            serena_tools = tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else ()
+            serena_memories = tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else ()
+            serena_paths = tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else ()
+            if used_serena:
+                markdown = _format_partial_review_from_exploration(
+                    error=msg,
+                    used_tools=serena_tools,
+                    used_memories=serena_memories,
+                    used_paths=serena_paths,
+                )
+            else:
+                markdown = _format_reviewer_error(model, msg)
             return ReviewerOutcome(
                 ok=False,
                 model=model,
                 used_serena=used_serena,
                 serena_disabled_reason=serena_disabled_reason,
                 serena_activated_project=serena_ctx.activated_project if serena_ctx is not None else None,
-                serena_used_tools=tuple(sorted(serena_ctx.used_tools)) if serena_ctx is not None else (),
-                serena_used_memories=tuple(sorted(serena_ctx.used_memories)) if serena_ctx is not None else (),
-                serena_used_paths=tuple(sorted(serena_ctx.used_paths)) if serena_ctx is not None else (),
-                markdown=_format_reviewer_error(model, msg),
+                serena_used_tools=serena_tools,
+                serena_used_memories=serena_memories,
+                serena_used_paths=serena_paths,
+                markdown=markdown,
                 error=msg,
             )
         except Exception as exc:
@@ -954,3 +1047,52 @@ def _format_reviewer_error(model: str, error: str) -> str:
         "## Questions / Unknowns\n"
         "- Did the model support tool calling and/or was Serena available?\n"
     )
+
+
+def _format_partial_review_from_exploration(
+    *,
+    error: str,
+    used_tools: tuple[str, ...],
+    used_memories: tuple[str, ...],
+    used_paths: tuple[str, ...],
+) -> str:
+    lines: list[str] = []
+    lines.append("## Summary")
+    lines.append(f"{error}. Exploration completed before timeout — findings below are based on partial context only.")
+    lines.append("")
+    lines.append("## Partial Review Context")
+    lines.append("This is not a complete review. The reviewer explored the repository but timed out before producing")
+    lines.append("a model-synthesized analysis. Below is a deterministic summary of what was inspected.")
+    lines.append("")
+
+    if used_tools:
+        tool_list = ", ".join(f"`{t}`" for t in used_tools)
+        lines.append(f"- **Tools invoked**: {tool_list}")
+    if used_memories:
+        mem_list = ", ".join(f"`{m}`" for m in used_memories)
+        lines.append(f"- **Memories loaded**: {mem_list}")
+    if used_paths:
+        path_list = ", ".join(f"`{p}`" for p in used_paths)
+        lines.append(f"- **Paths inspected**: {path_list}")
+
+    lines.append("")
+    lines.append("## Key Findings")
+    lines.append(f"- **High**: {error}.")
+    if used_tools:
+        lines.append("- **Medium**: Reviewer had partial repository context (via tool calls) but could not synthesize findings.")
+    else:
+        lines.append("- **High**: No tool-based exploration was completed before timeout.")
+    lines.append("")
+    lines.append("## Recommendations")
+    lines.append("- Re-run the review with a longer timeout or smaller scope.")
+    if used_tools:
+        lines.append("- Consider reducing the number of files/paths to allow the reviewer to complete analysis.")
+    lines.append("")
+    lines.append("## Questions / Unknowns")
+    if used_tools:
+        lines.append("- What findings would the reviewer have produced with more time?")
+    else:
+        lines.append("- Was the timeout too short for the model to respond?")
+    lines.append("")
+
+    return "\n".join(lines)

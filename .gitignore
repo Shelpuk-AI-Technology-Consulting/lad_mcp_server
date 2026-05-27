@@ -210,3 +210,7 @@ __marimo__/
 /.serena/
 /test.env
 /.requirements/
+/.idea/
+/.claude/
+AGENTS.md
+IMPROVEMENTS.md

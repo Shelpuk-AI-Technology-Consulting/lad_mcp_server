@@ -92,4 +92,15 @@ def user_prompt_code_review(*, code: str, context: str | None) -> str:
 
 
 def force_finalize_system_message() -> str:
-    return "You have reached the maximum tool call budget. Provide your final review now without further tool calls."
+    return (
+        "You have reached the maximum tool call budget. You MUST now produce your final review.\n"
+        "Focus on the current message chain: all tool results, inputs, and observations you have gathered so far.\n"
+        "Extract concrete gaps, contradictions, inconsistencies, and improvement opportunities from that evidence.\n"
+        "Do not summarize which tools you called or which files you explored.\n"
+        "Instead, provide actionable findings directly.\n"
+        "Return Markdown with sections:\n"
+        "## Summary\n"
+        "## Key Findings\n"
+        "## Recommendations\n"
+        "## Questions / Unknowns\n"
+    )
