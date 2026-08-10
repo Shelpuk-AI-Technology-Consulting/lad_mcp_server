@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import signal
 import queue
 import subprocess
 import threading
@@ -35,6 +37,48 @@ from typing import Any, Sequence
 
 class McpHandshakeError(RuntimeError):
     """Raised when the server fails to complete an MCP handshake."""
+
+
+def _spawn_kwargs() -> dict[str, Any]:
+    """Platform options that make the child reapable as a whole tree.
+
+    On POSIX the child gets its own session, so the process *group* can be signalled
+    — otherwise killing a wrapper such as ``uvx`` leaves the real server running.
+    Windows needs no spawn-time flag; ``taskkill /T`` walks the tree instead.
+
+    Returns:
+        Keyword arguments for :class:`subprocess.Popen`.
+    """
+    return {} if os.name == "nt" else {"start_new_session": True}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill a process and every descendant it spawned.
+
+    ``proc.kill()`` reaps only the process we spawned. For every wrapper invocation
+    — ``uvx``, ``uv run``, ``docker run`` — that process is *not* the server, so a
+    server which ignores stdin EOF survives with its pipes held open, and the reader
+    threads never see EOF. Verified: a grandchild outlived teardown until this
+    existed.
+
+    Args:
+        proc: The spawned process.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=30,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        # Fall back to the single-process kill rather than leaving it running.
+        with contextlib.suppress(OSError):
+            proc.kill()
 
 
 @dataclass
@@ -162,6 +206,7 @@ def handshake(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            **_spawn_kwargs(),
         )
     except OSError as exc:
         raise McpHandshakeError(f"could not start {argv[0]!r}: {exc}") from exc
@@ -260,8 +305,9 @@ def handshake(
         # that ignores EOF, for no benefit.
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-        # Only reached if it ignored EOF.
-        proc.kill()
+        # Only reached if it ignored EOF. Kill the whole tree, not just the process
+        # we spawned — for a wrapper invocation that process is not the server.
+        _kill_process_tree(proc)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
         stdout_thread.join(timeout=5)

@@ -131,12 +131,16 @@ _IN_TREE_SHAPES = [
 
 
 def _skip_if_missing_console_script(argv: list[str]) -> None:
-    """Skip when the console script could not be located.
+    """Skip only the console-script row when that script is not installed.
+
+    Gated on `argv`, not on `_CONSOLE_SCRIPT` alone: the `python -m` row does not
+    need the entry point, and skipping it too would silently drop module-entrypoint
+    coverage on any checkout that has dependencies but no installed script.
 
     Args:
         argv: The invocation being tested.
     """
-    if _CONSOLE_SCRIPT is None:
+    if _CONSOLE_SCRIPT is None and argv[0] == "lad-mcp-server":
         pytest.skip("console script 'lad-mcp-server' is not installed")
 
 
@@ -387,13 +391,22 @@ def docker_image() -> str:
 
 @pytest.mark.slow
 def test_docker_image_completes_handshake(docker_image: str, tmp_path: Path) -> None:
-    """The documented Docker deployment starts and serves MCP."""
+    """The documented Docker deployment starts and serves MCP.
+
+    Named explicitly and force-removed afterwards: a container is not a child
+    process, so killing the `docker run` client does not stop it. Process-tree kill
+    cannot reach across the daemon boundary — only the name can.
+    """
+    container = f"lad-smoke-{uuid.uuid4().hex[:8]}"
     argv = [
-        "docker", "run", "-i", "--rm",
+        "docker", "run", "-i", "--rm", "--name", container,
         "-e", f"OPENROUTER_API_KEY={_FAKE_KEY}",
         docker_image,
     ]
 
-    result = handshake(argv, env=_client_env(), cwd=str(tmp_path), timeout=180.0)
+    try:
+        result = handshake(argv, env=_client_env(), cwd=str(tmp_path), timeout=180.0)
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=120)
 
     assert set(_tool_names(result)) == {"system_design_review", "code_review"}

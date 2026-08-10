@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 from mcp_stdio_client import McpHandshakeError, handshake
@@ -125,3 +126,32 @@ def test_failed_handshake_leaves_no_running_child_or_threads(tmp_path) -> None:
     assert threading.active_count() == threads_before, "reader threads outlived the handshake"
     assert pid_file.exists(), "child never started; the test would be vacuous"
     assert not _process_alive(int(pid_file.read_text())), "child process outlived the handshake"
+
+
+def test_failed_handshake_reaps_a_wrapper_grandchild(tmp_path) -> None:
+    """Teardown reaps the real server behind a wrapper, not just the wrapper.
+
+    `uvx`, `uv run` and `docker run` are all wrappers: the process we spawn is not
+    the server. `proc.kill()` reaps only the wrapper, so a server that ignores stdin
+    EOF survives holding its pipes open — the exact leak the direct-child test above
+    cannot see. Verified failing before the process-tree kill existed.
+    """
+    pid_file = tmp_path / "grandchild.pid"
+    grandchild = (
+        "import os,sys,time;"
+        f"open(r'{pid_file}','w').write(str(os.getpid()));"
+        "sys.stdout.flush();"
+        "time.sleep(120)"
+    )
+    wrapper = f"import subprocess,sys; subprocess.run([sys.executable,'-c',{grandchild!r}])"
+
+    with pytest.raises(McpHandshakeError):
+        handshake(_python(wrapper), env=dict(os.environ), timeout=4.0)
+
+    # The grandchild writes its pid at startup; give the spawn a moment to land.
+    deadline = time.monotonic() + 5
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    assert pid_file.exists(), "grandchild never started; the test would be vacuous"
+    assert not _process_alive(int(pid_file.read_text())), "grandchild outlived the handshake"
