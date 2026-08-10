@@ -1011,13 +1011,35 @@ class ReviewService:
         - `.serena/` (enables Serena integration)
         - `.git/` (common VCS marker)
         Otherwise return the original `start`.
+
+        The climb never promotes the root into a directory that
+        :func:`~lad_mcp_server.path_utils.is_dangerous_repo_root` rejects, so a
+        marker in such a location cannot make the whole review fail. A `start`
+        that is itself dangerous is returned unchanged, leaving the caller's own
+        guard to reject it.
+
+        Args:
+            start: Absolute, already-resolved directory to begin the climb from.
+            max_depth: Maximum number of ancestors to inspect.
+
+        Returns:
+            The nearest marked ancestor strictly below the first dangerous
+            ancestor. Falls back to ``start`` when no such marker exists,
+            when ``start`` is itself dangerous, or when ``max_depth`` is
+            exhausted.
         """
         cur = start
         for _ in range(max_depth):
+            # Serena's global `~/.serena` is a user config directory, not a project
+            # marker. Stop before adopting any root the caller is bound to reject.
+            if is_dangerous_repo_root(cur):
+                break
             if (cur / ".serena").is_dir():
                 return cur
             if (cur / ".git").is_dir():
                 return cur
+            # Defence in depth: unreachable while the guard above rejects
+            # filesystem roots, which it does via `_is_filesystem_root`.
             if cur.parent == cur:
                 break
             cur = cur.parent
