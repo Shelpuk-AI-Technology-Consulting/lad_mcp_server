@@ -97,7 +97,7 @@ We built **Lad** for our internal use and decided to open-source it. Here's what
 
 ### Dual-reviewer mode by default
 
-✅ Lad runs **two reviewers in parallel** (default: `moonshotai/kimi-k2.5` and `minimax/minimax-m2.7`)
+✅ Lad runs **two reviewers in parallel** (default: `google/gemma-4-31b-it` and `minimax/minimax-m2.7`; set `OPENROUTER_PRIMARY_REVIEWER_MODEL` to swap in a stronger primary, e.g. `moonshotai/kimi-k2.5`)
 
 ✅ Reduces individual model bias and catches more issues
 
@@ -431,9 +431,16 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 
 ### OpenRouter models
 
-- `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `moonshotai/kimi-k2.5`)
+- `OPENROUTER_PRIMARY_REVIEWER_MODEL` (default: `google/gemma-4-31b-it`)
 - `OPENROUTER_SECONDARY_REVIEWER_MODEL` (default: `minimax/minimax-m2.7`)
   - Set to `0` to disable the Secondary reviewer (Primary-only mode).
+
+The defaults are chosen to work out of the box on a modest budget. For the strongest
+reviews we run `moonshotai/kimi-k2.5` as primary — set it explicitly:
+
+```
+OPENROUTER_PRIMARY_REVIEWER_MODEL=moonshotai/kimi-k2.5
+```
 
 ### Direct provider endpoints
 
@@ -444,6 +451,7 @@ Lad can route reviewer calls directly to provider endpoints, bypassing OpenRoute
 | `z-ai/` or `zai/` | Z.AI Coding Plan | `ZAI_CODING_PLAN_KEY` | Supports Preserved Thinking (reasoning models like GLM-5). Model prefix is stripped: `z-ai/glm-5` → `glm-5`. |
 | `deepseek/` | DeepSeek API | `DEEPSEEK_API_KEY` | Thinking mode enabled automatically. Model prefix is stripped: `deepseek/deepseek-v4-pro` → `deepseek-v4-pro`. Reasoning content is preserved across tool-call rounds. |
 | `moonshotai/` or `kimi-for-coding` | Kimi Code | `KIMI_CODE_API_KEY` | Routes to Kimi Code endpoint. All models normalize to `kimi-for-coding`. |
+| `ollama/` or `ollama_cloud/` | Ollama Cloud | `OLLAMA_API_KEY` | Prefix is stripped: `ollama/gemma4:31b` → `gemma4:31b`. Note Ollama model ids are `name:size`, **not** `vendor/model` — write `ollama/gemma4:31b`, not `ollama/google/gemma4`. |
 
 Example configuration for Z.AI GLM-5.1 as primary, DeepSeek as secondary:
 
@@ -465,16 +473,18 @@ Example configuration for Z.AI GLM-5.1 as primary, DeepSeek as secondary:
 
 - `OPENROUTER_MAX_CONCURRENT_REQUESTS` (default: `4`)
 - `OPENROUTER_REVIEWER_TIMEOUT_SECONDS` (default: `300`, wall-clock per reviewer run)
-- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `360`, per tool call; must be >= reviewer timeout)
+- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` (default: `360`, per tool call; must be strictly greater than the reviewer timeout — equal values are rejected at startup)
 - `OPENROUTER_HTTP_REFERER` (optional; forwarded to OpenRouter)
 - `OPENROUTER_X_TITLE` (optional; forwarded to OpenRouter)
 - `INTERMITTENT_REVIEW_CALLS` (default: `2`). When `> 0`, Lad dispatches a parallel, non-blocking LLM side-call to the same model every N tool calls during a reviewer's Serena-exploration loop. The side-call asks for a partial review based on the conversation gathered so far. The most recent successful snapshot is cached. **If the reviewer wall-clock timeout fires before the model finalizes, Lad returns the cached snapshot (marked as intermittent)**. If no model-generated snapshot is available, Lad synthesizes a **deterministic exploration digest** from the tool call history (files read, symbols found, search matches), or a **tool-exploration trace summary** from the Serena tool call history. Both fallbacks produce review-shaped markdown with all required sections. Set to `0` to disable.
+- `INTERMITTENT_MAX_OUTPUT_TOKENS` (default: `1500`). Output cap for each intermittent side-call. Capped again by the reviewer's own output budget, so raising it above `OPENROUTER_FIXED_OUTPUT_TOKENS` has no effect.
 
 ### Direct provider API keys (optional – bypass OpenRouter)
 
 - `ZAI_CODING_PLAN_KEY` (optional). When set, models with `z-ai/` prefix route directly to the Z.AI Coding Plan endpoint.
 - `KIMI_CODE_API_KEY` (optional). When set, models with `moonshotai/` prefix or `kimi-for-coding` route directly to the Kimi Code endpoint.
 - `DEEPSEEK_API_KEY` (optional). When set, models with `deepseek/` prefix route directly to the DeepSeek API with thinking mode enabled.
+- `OLLAMA_API_KEY` (optional). When set, models with `ollama/` or `ollama_cloud/` prefix route directly to Ollama Cloud.
 
 ### Budgeting / limits
 
@@ -493,7 +503,7 @@ Note: if your reviewer output is frequently cut off, increase `OPENROUTER_FIXED_
 - `LAD_SERENA_MAX_TOOL_CALLS` (default: `32`)
 - `LAD_SERENA_TOOL_TIMEOUT_SECONDS` (default: `30`)
 - `LAD_SERENA_MAX_TOOL_RESULT_CHARS` (default: `12000`)
-- `LAD_SERENA_MAX_TOTAL_CHARS` (default: `50000`)
+- `LAD_SERENA_MAX_TOTAL_CHARS` (default: `100000`)
 - `LAD_SERENA_MAX_DIR_ENTRIES` (default: `100`)
 - `LAD_SERENA_MAX_SEARCH_RESULTS` (default: `20`)
 
@@ -501,6 +511,10 @@ Note: if your reviewer output is frequently cut off, increase `OPENROUTER_FIXED_
 
 - `LAD_ENV_FILE` (optional `KEY=VALUE` file, loaded only for missing vars)
 - `.env` (optional; loaded if `python-dotenv` is installed)
+
+### Host-provided
+
+- `CODEX_WORKSPACE_ROOT` (optional; set by Codex). When present and pointing at a real directory, Lad uses it as the reviewed project root, ahead of inferring one from absolute `paths` or falling back to the current working directory.
 
 Precedence note: Lad never overrides variables that are already set in the process environment. It only fills missing variables from `LAD_ENV_FILE` first, then (optionally) from `.env`.
 
@@ -659,7 +673,7 @@ We also recommend that you prioritize OpenRouter providers by throughput:
 - “OPENROUTER_API_KEY is required”: ensure the MCP client process has access to the variable (or paste it into the client config).
 - Secondary reviewer is too expensive/slow: set `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`.
 - Reviewer returns “Reviewer Error” on timeout: ensure your MCP client's tool execution timeout exceeds Lad's `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS`. For Claude Code, set `MCP_TOOL_TIMEOUT` (in the Lad `env` block or globally) to at least 2× your reviewer timeout.
-- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be >= OPENROUTER_REVIEWER_TIMEOUT_SECONDS`: Lad validates that the tool-call timeout is at least as large as the reviewer timeout. Increase `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` or decrease `OPENROUTER_REVIEWER_TIMEOUT_SECONDS`.
+- `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > OPENROUTER_REVIEWER_TIMEOUT_SECONDS`: Lad requires the tool-call timeout to be **strictly greater** than the reviewer timeout — equal values risk both firing at once and cancelling the reviewer prematurely. Increase `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` or decrease `OPENROUTER_REVIEWER_TIMEOUT_SECONDS`.
 - Stale package after updating: add `--refresh` to the `uvx` args in your MCP config, then fully restart your MCP client (not just reconnect).
 
 ## Security notes
