@@ -1010,7 +1010,6 @@ class ReviewService:
         Priority:
         - `.serena/` (enables Serena integration)
         - `.git/` (common VCS marker)
-        Otherwise return the original `start`.
 
         The climb never promotes the root into a directory that
         :func:`~lad_mcp_server.path_utils.is_dangerous_repo_root` rejects, so a
@@ -1038,8 +1037,9 @@ class ReviewService:
                 return cur
             if (cur / ".git").is_dir():
                 return cur
-            # Defence in depth: unreachable while the guard above rejects
-            # filesystem roots, which it does via `_is_filesystem_root`.
+            # Termination guarantee that does not depend on the guard above.
+            # `is_dangerous_repo_root` happens to reject filesystem roots today, so
+            # this rarely fires — but the loop must still terminate if that changes.
             if cur.parent == cur:
                 break
             cur = cur.parent

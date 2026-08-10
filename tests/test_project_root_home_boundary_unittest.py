@@ -88,11 +88,8 @@ class _OpenRouterCaptureStub:
         return type("R", (), {"content": "## Summary\nOK", "tool_calls": [], "raw": {}})()
 
 
-def _settings(*, secondary: str = "0") -> Settings:
-    """Build a Settings instance that never touches the network.
-
-    Args:
-        secondary: Secondary reviewer model, or ``"0"`` to disable it.
+def _settings() -> Settings:
+    """Build a single-reviewer Settings instance that never touches the network.
 
     Returns:
         A fully populated :class:`Settings` for tests.
@@ -100,7 +97,7 @@ def _settings(*, secondary: str = "0") -> Settings:
     return Settings(
         openrouter_api_key="test",
         openrouter_primary_reviewer_model=PRIMARY_MODEL,
-        openrouter_secondary_reviewer_model=secondary,
+        openrouter_secondary_reviewer_model="0",
         openrouter_http_referer=None,
         openrouter_x_title=None,
         openrouter_reviewer_timeout_seconds=5,
@@ -140,7 +137,7 @@ class TestProjectRootHomeBoundary(unittest.TestCase):
 
         # `_resolve_project_root` short-circuits on CODEX_WORKSPACE_ROOT before any
         # path inference, which would bypass the code under test entirely.
-        env_patcher = mock.patch.dict(os.environ, {}, clear=False)
+        env_patcher = mock.patch.dict(os.environ)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
         os.environ.pop("CODEX_WORKSPACE_ROOT", None)
@@ -160,23 +157,16 @@ class TestProjectRootHomeBoundary(unittest.TestCase):
         self.assertEqual(result, start)
         self.assertNotEqual(result, self.home)
 
-    def test_walk_up_still_finds_git_marker_below_home(self) -> None:
-        """A real ``.git`` marker below home is still found."""
-        repo = self.home / "repo"
-        (repo / ".git").mkdir(parents=True)
-        start = repo / "src" / "pkg"
-        start.mkdir(parents=True)
+    def test_walk_up_still_finds_markers_below_home(self) -> None:
+        """Both marker kinds are still honoured below the home boundary."""
+        for marker in (".git", ".serena"):
+            with self.subTest(marker=marker):
+                repo = self.home / f"repo_{marker.lstrip('.')}"
+                (repo / marker).mkdir(parents=True)
+                start = repo / "src" / "pkg"
+                start.mkdir(parents=True)
 
-        self.assertEqual(ReviewService._walk_up_for_project_root(start), repo)
-
-    def test_walk_up_still_finds_serena_marker_below_home(self) -> None:
-        """A project-level ``.serena`` marker below home is still found."""
-        repo = self.home / "repo"
-        (repo / ".serena").mkdir(parents=True)
-        start = repo / "src" / "pkg"
-        start.mkdir(parents=True)
-
-        self.assertEqual(ReviewService._walk_up_for_project_root(start), repo)
+                self.assertEqual(ReviewService._walk_up_for_project_root(start), repo)
 
     def test_walk_up_returns_nearest_marker_ancestor(self) -> None:
         """The nearest marked ancestor wins over a more distant one."""
