@@ -11,12 +11,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from lad_mcp_server.config import Settings
 from lad_mcp_server.model_metadata import ModelMetadata, ProviderLimits
 from lad_mcp_server.openrouter_client import OpenRouterClientError
-from lad_mcp_server.prompts import force_finalize_system_message
 from lad_mcp_server.review_service import ReviewService
 
 
@@ -266,7 +264,6 @@ class TestSystemRoleFallback(unittest.TestCase):
             repo = Path(td)
             client = _VerifyNoSystemClient()
             service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
-            serena = _SerenaCtx()
 
             # Pre-cache the fallback
             service._remember_system_role_fallback(model)

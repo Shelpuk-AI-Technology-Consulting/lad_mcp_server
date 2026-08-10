@@ -28,6 +28,8 @@ def is_dangerous_repo_root(repo_root: Path) -> bool:
         return True
 
     # Avoid allowing "home directory root" as a project root (too broad).
+    # Must stay an exact match: `ReviewService._walk_up_for_project_root` stops its
+    # climb here, so a prefix match would collapse every root under a user's home.
     try:
         home = Path.home().resolve()
         if root == home:
