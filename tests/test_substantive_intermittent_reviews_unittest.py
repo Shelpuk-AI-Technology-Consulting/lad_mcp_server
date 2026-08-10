@@ -60,7 +60,11 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 37)  # min(45, max(20, 300//8))
+            # Between the bounds, so proportional to the reviewer timeout: 300 // 8.
+            # Deliberately a literal, not `300 // INTERMITTENT_REVIEW_TIMEOUT_DIVISOR` —
+            # deriving the expectation from the same constant the code uses makes the
+            # assertion tautological and lets a changed constant pass unnoticed.
+            self.assertEqual(service._intermittent_timeout, 37)
 
     def test_short_reviewer_timeout_gives_floor_20(self) -> None:
         settings = _build_settings(openrouter_reviewer_timeout_seconds=60)
@@ -71,7 +75,8 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 20)  # max(20, 60//8=7) = 20
+            # 60 // 8 = 7 would undercut the floor, so the floor wins.
+            self.assertEqual(service._intermittent_timeout, 20)
 
     def test_long_reviewer_timeout_gives_cap_45(self) -> None:
         settings = _build_settings(openrouter_reviewer_timeout_seconds=600)
@@ -82,7 +87,8 @@ class TestProportionalIntermittentTimeout(unittest.TestCase):
                 openrouter_client=mock.Mock(),
                 models_client=mock.Mock(),
             )
-            self.assertEqual(service._intermittent_timeout, 45)  # min(45, max(20, 600//8=75))
+            # 600 // 8 = 75 would exceed the cap, so the cap wins.
+            self.assertEqual(service._intermittent_timeout, 45)
 
 
 # ---------------------------------------------------------------------------

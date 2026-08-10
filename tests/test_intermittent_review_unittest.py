@@ -14,7 +14,8 @@ from lad_mcp_server.model_metadata import ModelMetadata, ProviderLimits
 from lad_mcp_server.openrouter_client import OpenRouterCallResult, OpenRouterClientError
 from lad_mcp_server.token_budget import TokenBudget
 from lad_mcp_server.review_service import (
-    INTERMITTENT_REVIEW_TIMEOUT_SECONDS,
+    INTERMITTENT_REVIEW_MAX_TIMEOUT_SECONDS,
+    INTERMITTENT_REVIEW_MIN_TIMEOUT_SECONDS,
     EXPLORATION_DIGEST_MAX_SNIPPET_CHARS,
     ExplorationDigest,
     IntermittentReviewState,
@@ -2015,8 +2016,18 @@ class TestSuccessPathEmptyContentFallback(unittest.TestCase):
 
 
 class TestConstants(unittest.TestCase):
-    def test_intermittent_review_timeout_seconds_is_45(self) -> None:
-        self.assertEqual(INTERMITTENT_REVIEW_TIMEOUT_SECONDS, 45)
+    def test_intermittent_timeout_bounds_are_ordered(self) -> None:
+        """The floor must sit below the cap, or the clamp inverts.
+
+        Asserts the relationship rather than the magic numbers: the values
+        themselves are pinned behaviourally in
+        `test_substantive_intermittent_reviews_unittest.py`, so restating them
+        here would only make the bounds harder to tune.
+        """
+        self.assertLess(
+            INTERMITTENT_REVIEW_MIN_TIMEOUT_SECONDS,
+            INTERMITTENT_REVIEW_MAX_TIMEOUT_SECONDS,
+        )
 
 
 if __name__ == "__main__":

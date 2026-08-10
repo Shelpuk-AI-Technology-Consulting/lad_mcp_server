@@ -88,6 +88,58 @@ class SerenaContext:
         except ValueError as exc:
             raise SerenaToolError(str(exc)) from exc
 
+    def _repo_relative_posix(self, path: Path) -> str | None:
+        """Convert a path to a repo-relative POSIX string.
+
+        Repo-relative paths are identifiers here, not filesystem arguments: they are
+        embedded in reviewer prompts, compared against :class:`FileContextBuilder`
+        output, and printed in the disclosure block. They must never be absolute and
+        never contain a backslash, on any platform.
+
+        Args:
+            path: A filesystem path, absolute or relative to the repo root.
+
+        Returns:
+            The repo-relative path using forward slashes, or ``None`` when it
+            resolves outside the repo root.
+        """
+        candidate = path if path.is_absolute() else (self.repo_root / path)
+        try:
+            return candidate.resolve().relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return None
+
+    def _normalize_match_line(self, line: str) -> tuple[str, str] | None:
+        """Rewrite one ``rg -n --null`` output line to carry a repo-relative POSIX path.
+
+        ``--null`` makes ``rg`` terminate the path with a NUL byte instead of the
+        usual colon, which is the only way to split it unambiguously: the path may
+        be absolute (a Windows drive letter contains a colon), and on POSIX a
+        filename may itself contain ``:<digits>:``. Guessing with a ``path:line:``
+        pattern fabricated entries in both cases — ``D`` from ``D:\\repo\\...``, and
+        ``src`` from a file named ``src:2:notes.txt`` in a repo that has a ``src/``
+        directory.
+
+        A line without a NUL is therefore dropped rather than guessed at. The caller
+        detects wholesale parse failure and re-runs the search in Python, so an
+        ``rg`` build that ignored the flag degrades instead of reporting no matches.
+
+        Args:
+            line: One line of ``rg -n --null`` output, i.e. ``path\\0line:text``.
+
+        Returns:
+            A ``(repo_relative_path, rewritten_line)`` pair, or ``None`` when the
+            line carries no NUL or names a path outside the repo root.
+        """
+        raw_path, sep, remainder = line.partition("\0")
+        if not sep:
+            return None
+        rel = self._repo_relative_posix(Path(raw_path))
+        if rel is None:
+            return None
+        # Restore the human-readable `path:line:text` shape for the model.
+        return rel, f"{rel}:{remainder}"
+
     def tool_schemas(self) -> list[dict[str, Any]]:
         """
         OpenAI-compatible tool schema definitions to pass to models via OpenRouter.
@@ -434,8 +486,9 @@ class SerenaContext:
         entries = []
         for child in sorted(target.iterdir(), key=lambda p: p.name)[: self._limits.max_dir_entries]:
             entries.append({"name": child.name, "type": "dir" if child.is_dir() else "file"})
-        self.used_paths.add(str(target.relative_to(self.repo_root)))
-        return {"path": str(target.relative_to(self.repo_root)), "entries": entries}
+        rel = target.relative_to(self.repo_root).as_posix()
+        self.used_paths.add(rel)
+        return {"path": rel, "entries": entries}
 
     def _search_for_pattern(self, pattern: Any, path: Any) -> dict[str, Any]:
         if not isinstance(pattern, str) or pattern.strip() == "":
@@ -447,40 +500,63 @@ class SerenaContext:
             if restrict_dir.is_file():
                 restrict_dir = restrict_dir.parent
 
-        # Prefer ripgrep if available (fast, with max-count).
+        # Prefer ripgrep if available (fast, with max-count). Run from the repo root
+        # with a repo-relative target so paths come back relative, and with `--null`
+        # so the path is NUL-terminated — the only unambiguous way to split it.
         cmd = [
             "rg",
             "-n",
+            "--null",
             "--max-count",
             str(self._limits.max_search_results),
             pattern,
-            str(restrict_dir),
+            restrict_dir.relative_to(self.repo_root).as_posix(),
         ]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self._limits.tool_timeout_seconds)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._limits.tool_timeout_seconds,
+                cwd=str(self.repo_root),
+            )
         except FileNotFoundError:
             return self._search_for_pattern_fallback(pattern, restrict_dir)
         except subprocess.TimeoutExpired:
             raise SerenaToolError("search timed out")
 
-        # rg exit code 1 means no matches; treat as empty.
+        # rg exit codes: 0 = matched, 1 = no match, >= 2 = error. An error with no
+        # output (an unknown flag, say) previously read as "no matches"; search in
+        # Python instead of silently reporting nothing.
         stdout = proc.stdout.strip()
+        if proc.returncode >= 2 and not stdout:
+            return self._search_for_pattern_fallback(pattern, restrict_dir)
         matches = stdout.splitlines() if stdout else []
 
-        # Normalize paths to repo-relative for reporting.
+        # Normalize paths to repo-relative POSIX; drop anything we cannot place
+        # inside the repo rather than leaking an absolute host path to the model.
         rel_matches: list[str] = []
+        delimited = 0
         for line in matches[: self._limits.max_search_results]:
-            # rg format: path:line:match
-            if ":" in line:
-                p = line.split(":", 1)[0]
-                try:
-                    rel_p = str(Path(p).resolve().relative_to(self.repo_root))
-                    self.used_paths.add(rel_p)
-                    rel_matches.append(line.replace(p, rel_p, 1))
-                except Exception:
-                    rel_matches.append(line)
-            else:
-                rel_matches.append(line)
+            # Counted separately from the result: a line we cannot split is a parser
+            # failure, whereas one that splits but resolves outside the repo is a
+            # legitimate drop. Conflating them would make one stray match re-run the
+            # whole search.
+            if "\0" not in line:
+                continue
+            delimited += 1
+            normalized = self._normalize_match_line(line)
+            if normalized is None:
+                continue
+            rel, rewritten = normalized
+            self.used_paths.add(rel)
+            rel_matches.append(rewritten)
+
+        # rg produced output but not one line carried a NUL — most likely a build
+        # that ignored `--null`. Reporting "no matches" would be a wrong answer
+        # rather than a degraded one, so redo the search in Python.
+        if matches and delimited == 0:
+            return self._search_for_pattern_fallback(pattern, restrict_dir)
         return {"matches": rel_matches}
 
     def _search_for_pattern_fallback(self, pattern: str, restrict_dir: Path) -> dict[str, Any]:
@@ -537,11 +613,10 @@ class SerenaContext:
                     if len(matches) >= self._limits.max_search_results:
                         break
                     if pattern in line:
-                        try:
-                            rel = str(fp.resolve().relative_to(self.repo_root))
-                            self.used_paths.add(rel)
-                        except Exception:
-                            rel = str(fp)
+                        rel = self._repo_relative_posix(fp)
+                        if rel is None:
+                            continue
+                        self.used_paths.add(rel)
                         matches.append(f"{rel}:{i}:{line[:200]}")
 
             if len(matches) >= self._limits.max_search_results:
@@ -575,7 +650,7 @@ class SerenaContext:
             raise SerenaToolError("file is too large to search")
 
         text = target.read_text(encoding="utf-8", errors="replace")
-        rel = str(target.relative_to(self.repo_root))
+        rel = target.relative_to(self.repo_root).as_posix()
         self.used_paths.add(rel)
 
         sub_len = len(substring)
@@ -631,7 +706,7 @@ class SerenaContext:
         if size > LARGE_FILE_READ_MAX_BYTES and head_n is None and tail_n is None:
             raise SerenaToolError("file is too large to read without head/tail")
 
-        rel = str(target.relative_to(self.repo_root))
+        rel = target.relative_to(self.repo_root).as_posix()
         self.used_paths.add(rel)
 
         # Streaming path for files > LARGE_FILE_READ_MAX_BYTES with head/tail.
@@ -702,7 +777,7 @@ class SerenaContext:
         if num_lines < 0:
             raise SerenaToolError("num_lines must be >= 0")
 
-        rel = str(target.relative_to(self.repo_root))
+        rel = target.relative_to(self.repo_root).as_posix()
         self.used_paths.add(rel)
         if num_lines == 0:
             return {"path": rel, "start_line": start_line, "num_lines": num_lines, "content": ""}

@@ -48,7 +48,11 @@ SYSTEM_ROLE_FALLBACK_TTL_SECONDS = 3600
 SYSTEM_ROLE_FALLBACK_CACHE_MAX_MODELS = 128
 KIMI_FALLBACK_TTL_SECONDS = 600
 KIMI_FALLBACK_CACHE_MAX_MODELS = 128
-INTERMITTENT_REVIEW_TIMEOUT_SECONDS = 45
+# Bounds on the intermittent side-call timeout, which is derived from the reviewer
+# timeout rather than fixed — hence "MAX"/"MIN" rather than a single "TIMEOUT".
+INTERMITTENT_REVIEW_MAX_TIMEOUT_SECONDS = 45
+INTERMITTENT_REVIEW_MIN_TIMEOUT_SECONDS = 20
+INTERMITTENT_REVIEW_TIMEOUT_DIVISOR = 8
 CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
@@ -206,7 +210,11 @@ def _extract_path_from_arguments(arguments_json: str) -> str | None:
     raw_path = args.get("path") or args.get("relative_path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
-    return raw_path.strip()
+    # Repo-relative paths are POSIX identifiers on both sides of the tool boundary
+    # (see `SerenaContext._repo_relative_posix`). Without normalizing the model's raw
+    # argument, a Windows-style `src\a.txt` counts as a second distinct path in the
+    # exploration digest alongside the normalized `src/a.txt` from the tool result.
+    return raw_path.strip().replace("\\", "/")
 
 
 def _update_exploration_digest(
@@ -482,7 +490,13 @@ class ReviewService:
         # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
         self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
-        self._intermittent_timeout = min(45, max(20, self._settings.openrouter_reviewer_timeout_seconds // 8))
+        self._intermittent_timeout = min(
+            INTERMITTENT_REVIEW_MAX_TIMEOUT_SECONDS,
+            max(
+                INTERMITTENT_REVIEW_MIN_TIMEOUT_SECONDS,
+                self._settings.openrouter_reviewer_timeout_seconds // INTERMITTENT_REVIEW_TIMEOUT_DIVISOR,
+            ),
+        )
         self._tool_choice_fallback_until_by_model: dict[str, float] = {}
         self._tool_choice_fallback_lock = threading.Lock()
         self._system_role_fallback_until_by_model: dict[str, float] = {}
@@ -2179,52 +2193,3 @@ def _format_reviewer_error(model: str, error: str) -> str:
         "## Questions / Unknowns\n"
         "- Did the model support tool calling and/or was Serena available?\n"
     )
-
-
-def _format_partial_review_from_exploration(
-    *,
-    error: str,
-    used_tools: tuple[str, ...],
-    used_memories: tuple[str, ...],
-    used_paths: tuple[str, ...],
-) -> str:
-    lines: list[str] = []
-    lines.append("## Summary")
-    lines.append(f"{error}. Exploration completed before timeout — findings below are based on partial context only.")
-    lines.append("")
-    lines.append("## Partial Review Context")
-    lines.append("This is not a complete review. The reviewer explored the repository but timed out before producing")
-    lines.append("a model-synthesized analysis. Below is a deterministic summary of what was inspected.")
-    lines.append("")
-
-    if used_tools:
-        tool_list = ", ".join(f"`{t}`" for t in used_tools)
-        lines.append(f"- **Tools invoked**: {tool_list}")
-    if used_memories:
-        mem_list = ", ".join(f"`{m}`" for m in used_memories)
-        lines.append(f"- **Memories loaded**: {mem_list}")
-    if used_paths:
-        path_list = ", ".join(f"`{p}`" for p in used_paths)
-        lines.append(f"- **Paths inspected**: {path_list}")
-
-    lines.append("")
-    lines.append("## Key Findings")
-    lines.append(f"- **High**: {error}.")
-    if used_tools:
-        lines.append("- **Medium**: Reviewer had partial repository context (via tool calls) but could not synthesize findings.")
-    else:
-        lines.append("- **High**: No tool-based exploration was completed before timeout.")
-    lines.append("")
-    lines.append("## Recommendations")
-    lines.append("- Re-run the review with a longer timeout or smaller scope.")
-    if used_tools:
-        lines.append("- Consider reducing the number of files/paths to allow the reviewer to complete analysis.")
-    lines.append("")
-    lines.append("## Questions / Unknowns")
-    if used_tools:
-        lines.append("- What findings would the reviewer have produced with more time?")
-    else:
-        lines.append("- Was the timeout too short for the model to respond?")
-    lines.append("")
-
-    return "\n".join(lines)
