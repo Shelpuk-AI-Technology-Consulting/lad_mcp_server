@@ -19,7 +19,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from lad_mcp_server import serena_bridge
 from lad_mcp_server.file_context import FileContextBuilder
 from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.serena_bridge import (
@@ -144,6 +146,68 @@ class TestSecretsSurviveTruncation(unittest.TestCase):
 
         self.assertNotIn("BEGIN RSA PRIVATE KEY", built.formatted)
         self.assertNotIn(_KEY_BODY_LINE, built.formatted)
+
+
+class TestSlicedReadsSuppressIncompleteKeys(unittest.TestCase):
+    """A key crossing a slice boundary keeps only one delimiter — and must still go.
+
+    Redaction matches a whole `BEGIN`..`END` block, so it is defeated by any caller
+    that sees only part of a file. Redacting the slice does not help: the head keeps
+    `BEGIN` without `END`, the tail keeps `END` without `BEGIN`, and neither
+    fragment matches.
+    """
+
+    def setUp(self) -> None:
+        """Build a repo with a key sandwiched between identifiable safe text."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.repo = Path(td.name).resolve()
+        (self.repo / ".serena").mkdir()
+        key = "\n".join(
+            ["-----BEGIN RSA PRIVATE KEY-----"] + [_KEY_BODY_LINE] * 40 + ["-----END RSA PRIVATE KEY-----"]
+        )
+        padding = "\n".join(f"# padding line {i}" for i in range(500))
+        (self.repo / "big.pem").write_text(
+            f"# SAFE-HEADER\n{key}\n{padding}\n# SAFE-FOOTER\n", encoding="utf-8"
+        )
+        self.ctx = SerenaContext(repo_root=self.repo, limits=_LIMITS)
+        self.ctx.activated_project = "."
+
+    def assert_no_key_material(self, raw: str) -> None:
+        """Assert neither a delimiter nor body survived.
+
+        Args:
+            raw: The tool's JSON envelope.
+        """
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", raw)
+        self.assertNotIn("END RSA PRIVATE KEY", raw)
+        self.assertNotIn(_KEY_BODY_LINE, raw)
+
+    def test_streaming_head_does_not_leak_a_key_crossing_the_cut(self) -> None:
+        """The large-file streaming branch suppresses a key that spans the head cut."""
+        with mock.patch.object(serena_bridge, "LARGE_FILE_READ_MAX_BYTES", 100):
+            raw = self.ctx.call_tool("read_file", json.dumps({"path": "big.pem", "head": 20}))
+
+        self.assert_no_key_material(raw)
+        # The safe prefix before the key must survive: suppression starts at the
+        # delimiter, it does not discard the whole slice.
+        self.assertIn("SAFE-HEADER", raw)
+
+    def test_streaming_tail_does_not_leak_a_key_crossing_the_cut(self) -> None:
+        """The mirror case: the tail keeps `END` without `BEGIN`."""
+        with mock.patch.object(serena_bridge, "LARGE_FILE_READ_MAX_BYTES", 100):
+            raw = self.ctx.call_tool("read_file", json.dumps({"path": "big.pem", "tail": 500}))
+
+        self.assert_no_key_material(raw)
+        self.assertIn("SAFE-FOOTER", raw)
+
+    def test_read_file_window_does_not_leak_a_visible_key_delimiter(self) -> None:
+        """A window starting at the key's `BEGIN` emits no key material."""
+        args = json.dumps({"path": "big.pem", "start_line": 2, "num_lines": 10})
+
+        raw = self.ctx.call_tool("read_file_window", args)
+
+        self.assert_no_key_material(raw)
 
 
 class TestRedactionStaysLinear(unittest.TestCase):

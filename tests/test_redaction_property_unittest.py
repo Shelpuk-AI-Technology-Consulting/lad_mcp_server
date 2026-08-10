@@ -35,9 +35,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # go red on a fresh random draw unrelated to a code change. The cost, stated plainly:
 # this is a fixed regression corpus, not a search. New counterexamples appear only
 # when a strategy or the Hypothesis version changes.
+# `deadline=None`, and the reasoning matters because an earlier version of this file
+# argued the opposite. These properties generate PEM blocks of at most eight body
+# lines, so Hypothesis's 200ms default could never have caught the quadratic PEM bug
+# — `test_many_unterminated_begin_markers_redact_quickly` is what catches that, with
+# an explicit 1s budget on a 595,000-char input. So the deadline here buys no
+# protection while producing real flakes: both properties failed on a loaded run
+# (214s wall clock) and passed on the next (71s). A security gate that goes red for
+# reasons unrelated to the code trains people to ignore it.
 _SECURITY = settings(
     max_examples=200,
     derandomize=True,
+    deadline=None,
     suppress_health_check=[HealthCheck.filter_too_much],
 )
 

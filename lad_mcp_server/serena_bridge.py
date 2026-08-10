@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 import re
 
-from lad_mcp_server.redaction import redact_text
+from lad_mcp_server.redaction import redact_text, suppress_incomplete_private_key_blocks
 from lad_mcp_server.path_utils import safe_resolve_under_repo
 
 LARGE_FILE_READ_MAX_BYTES = 100_000_000
@@ -719,17 +719,24 @@ class SerenaContext:
                         head_lines.append(line)
                     if tail_lines is not None:
                         tail_lines.append(line)
-            lines: list[str] = []
+            # This branch never sees the whole file — that is the point of streaming —
+            # so redaction alone cannot help a key that crosses a cut: the head keeps
+            # `BEGIN` without `END`, the tail keeps `END` without `BEGIN`, and neither
+            # fragment matches. Each segment is therefore redacted *and* stripped of
+            # incomplete key blocks, separately, so a safe prefix is not discarded
+            # along with the key material that follows it.
+            segments: list[str] = []
             if head_n is not None:
-                lines.extend(head_lines)
+                segments.append(
+                    suppress_incomplete_private_key_blocks(redact_text("".join(head_lines)))
+                )
             if tail_lines is not None:
                 if head_n is not None:
-                    lines.append("\n[NOTE: Middle of file omitted due to size.]\n")
-                lines.extend(list(tail_lines))
-            # Redact here too: this branch returns without reaching the whole-text
-            # redaction below, and its head/tail line slicing cuts PEM terminators
-            # exactly as the char-based truncation does.
-            content = redact_text("".join(lines))
+                    segments.append("\n[NOTE: Middle of file omitted due to size.]\n")
+                segments.append(
+                    suppress_incomplete_private_key_blocks(redact_text("".join(tail_lines)))
+                )
+            content = "".join(segments)
             result: dict[str, Any] = {"path": rel, "content": content}
             if (
                 size > LARGE_FILE_READ_MAX_BYTES
@@ -801,4 +808,9 @@ class SerenaContext:
                     break
                 lines.append(line)
 
-        return {"path": rel, "start_line": start_line, "num_lines": num_lines, "content": "".join(lines)}
+        # Same slice problem as the streaming branch: a window can hold a key's
+        # `BEGIN` without its `END`. This closes the case where a delimiter is
+        # visible; a window entirely inside a key body is pure base64 with nothing
+        # marking it as secret, and remains a known gap.
+        content = suppress_incomplete_private_key_blocks(redact_text("".join(lines)))
+        return {"path": rel, "start_line": start_line, "num_lines": num_lines, "content": content}

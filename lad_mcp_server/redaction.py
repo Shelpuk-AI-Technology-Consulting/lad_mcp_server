@@ -70,6 +70,51 @@ DEFAULT_RULES: tuple[RedactionRule, ...] = (
 )
 
 
+# Delimiters of a PEM block, matched individually. After `redact_text` has removed
+# every complete BEGIN..END pair, a *surviving* delimiter can only belong to a block
+# whose other end was cut away.
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----")
+
+_TRUNCATED_KEY_NOTE = "[REDACTED: truncated private key block]"
+
+
+def suppress_incomplete_private_key_blocks(text: str) -> str:
+    """Drop key material from a PEM block whose other delimiter was truncated away.
+
+    `redact_text` matches a whole ``BEGIN``..``END`` block, so it is defeated by any
+    caller that can only see a *slice* of a file: a key crossing the cut loses one
+    delimiter and the rule can no longer match it. That is not hypothetical — it is
+    how 15 lines of key material reached a prompt.
+
+    Call this on each slice **after** ``redact_text``. Anything from a surviving
+    ``BEGIN`` to the end of the slice, and from the start of the slice to a
+    surviving ``END``, is treated as key material and removed.
+
+    Deliberately conservative: it discards surrounding text rather than risk keeping
+    key bytes. It cannot help with a slice that contains no delimiter at all — a
+    window from the middle of a key is pure base64, and nothing in the text marks it
+    as secret.
+
+    Args:
+        text: A slice of file content, already passed through :func:`redact_text`.
+
+    Returns:
+        The slice with any incomplete key block removed.
+    """
+    # A surviving END has no BEGIN before it, so everything up to it is key material.
+    end = _PEM_END_RE.search(text)
+    if end is not None:
+        text = _TRUNCATED_KEY_NOTE + text[end.end():]
+
+    # A surviving BEGIN has no END after it, so everything from it on is key material.
+    begin = _PEM_BEGIN_RE.search(text)
+    if begin is not None:
+        text = text[: begin.start()] + _TRUNCATED_KEY_NOTE
+
+    return text
+
+
 def redact_text(text: str, *, rules: Iterable[RedactionRule] = DEFAULT_RULES) -> str:
     """
     Redact common secret/PII patterns from text.
