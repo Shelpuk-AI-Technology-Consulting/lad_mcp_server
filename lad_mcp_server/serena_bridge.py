@@ -19,10 +19,6 @@ READ_FILE_TRUNCATE_THRESHOLD = 10_000
 READ_FILE_MAX_HEAD_TAIL_CHARS = 1_000
 BASELINE_REQUIRED_MEMORIES = ("project_overview.md", "research_summary.md")
 
-# `rg -n` emits `path:line:text`. Non-greedy so the first `:<digits>:` wins, which
-# keeps a Windows drive letter from being mistaken for the whole path.
-_MATCH_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+):")
-
 
 class SerenaToolError(RuntimeError):
     pass
@@ -114,35 +110,35 @@ class SerenaContext:
             return None
 
     def _normalize_match_line(self, line: str) -> tuple[str, str] | None:
-        """Rewrite one ``rg -n`` output line to carry a repo-relative POSIX path.
+        """Rewrite one ``rg -n --null`` output line to carry a repo-relative POSIX path.
 
-        ``rg`` prints whatever path it was handed, so the prefix may be absolute —
-        on Windows including a drive letter. Splitting on the first colon would
-        then yield ``"D"`` rather than a path, so the line is matched against a
-        ``path:line:`` shape instead.
+        ``--null`` makes ``rg`` terminate the path with a NUL byte instead of the
+        usual colon, which is the only way to split it unambiguously: the path may
+        be absolute (a Windows drive letter contains a colon), and on POSIX a
+        filename may itself contain ``:<digits>:``. Guessing with a ``path:line:``
+        pattern fabricated entries in both cases — ``D`` from ``D:\\repo\\...``, and
+        ``src`` from a file named ``src:2:notes.txt`` in a repo that has a ``src/``
+        directory.
+
+        A line without a NUL is therefore dropped rather than guessed at. The caller
+        detects wholesale parse failure and re-runs the search in Python, so an
+        ``rg`` build that ignored the flag degrades instead of reporting no matches.
 
         Args:
-            line: One line of ``rg -n`` output, of the form ``path:line:text``.
+            line: One line of ``rg -n --null`` output, i.e. ``path\\0line:text``.
 
         Returns:
             A ``(repo_relative_path, rewritten_line)`` pair, or ``None`` when the
-            line is unparseable or names a path outside the repo root.
+            line carries no NUL or names a path outside the repo root.
         """
-        matched = _MATCH_LINE_RE.match(line)
-        if matched is None:
+        raw_path, sep, remainder = line.partition("\0")
+        if not sep:
             return None
-        raw_path = matched.group("path")
-        candidate = Path(raw_path)
-        # `resolve()` is non-strict, so any string the regex accepts would otherwise
-        # become a "repo path used". Colons are legal in POSIX filenames, so a file
-        # named `notes:2:draft.md` would fabricate the entry `notes` — the same class
-        # of defect as the Windows drive-letter bug. Require the file to exist.
-        if not (candidate if candidate.is_absolute() else self.repo_root / candidate).exists():
-            return None
-        rel = self._repo_relative_posix(candidate)
+        rel = self._repo_relative_posix(Path(raw_path))
         if rel is None:
             return None
-        return rel, rel + line[len(raw_path) :]
+        # Restore the human-readable `path:line:text` shape for the model.
+        return rel, f"{rel}:{remainder}"
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         """
@@ -505,11 +501,12 @@ class SerenaContext:
                 restrict_dir = restrict_dir.parent
 
         # Prefer ripgrep if available (fast, with max-count). Run from the repo root
-        # with a repo-relative target so rg prints relative paths; `_normalize_match_line`
-        # still handles absolute output, so this is an improvement, not a dependency.
+        # with a repo-relative target so paths come back relative, and with `--null`
+        # so the path is NUL-terminated — the only unambiguous way to split it.
         cmd = [
             "rg",
             "-n",
+            "--null",
             "--max-count",
             str(self._limits.max_search_results),
             pattern,
@@ -528,20 +525,38 @@ class SerenaContext:
         except subprocess.TimeoutExpired:
             raise SerenaToolError("search timed out")
 
-        # rg exit code 1 means no matches; treat as empty.
+        # rg exit codes: 0 = matched, 1 = no match, >= 2 = error. An error with no
+        # output (an unknown flag, say) previously read as "no matches"; search in
+        # Python instead of silently reporting nothing.
         stdout = proc.stdout.strip()
+        if proc.returncode >= 2 and not stdout:
+            return self._search_for_pattern_fallback(pattern, restrict_dir)
         matches = stdout.splitlines() if stdout else []
 
         # Normalize paths to repo-relative POSIX; drop anything we cannot place
         # inside the repo rather than leaking an absolute host path to the model.
         rel_matches: list[str] = []
+        delimited = 0
         for line in matches[: self._limits.max_search_results]:
+            # Counted separately from the result: a line we cannot split is a parser
+            # failure, whereas one that splits but resolves outside the repo is a
+            # legitimate drop. Conflating them would make one stray match re-run the
+            # whole search.
+            if "\0" not in line:
+                continue
+            delimited += 1
             normalized = self._normalize_match_line(line)
             if normalized is None:
                 continue
             rel, rewritten = normalized
             self.used_paths.add(rel)
             rel_matches.append(rewritten)
+
+        # rg produced output but not one line carried a NUL — most likely a build
+        # that ignored `--null`. Reporting "no matches" would be a wrong answer
+        # rather than a degraded one, so redo the search in Python.
+        if matches and delimited == 0:
+            return self._search_for_pattern_fallback(pattern, restrict_dir)
         return {"matches": rel_matches}
 
     def _search_for_pattern_fallback(self, pattern: str, restrict_dir: Path) -> dict[str, Any]:

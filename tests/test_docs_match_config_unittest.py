@@ -157,14 +157,17 @@ def _readme_documented_defaults() -> dict[str, str]:
     return {m.group("name"): m.group("value") for m in _README_DEFAULT_RE.finditer(text)}
 
 
-def _env_example_assignments() -> dict[str, str]:
-    """Scrape ``NAME=VALUE`` from ``.env.example``, skipping empty values.
+def _env_example_all_assignments() -> dict[str, str]:
+    """Scrape every ``NAME=VALUE`` from ``.env.example``, empty values included.
 
-    An empty value means "unset", which *is* the default, so those entries carry no
-    claim to check.
+    Presence must be judged on real assignments, not on the raw file text: a name
+    mentioned in a *comment* would otherwise count as documentation. Deleting the
+    ``OPENROUTER_REVIEWER_TIMEOUT_SECONDS=300`` line, for instance, left the name
+    present in the comment above the tool-call timeout.
 
     Returns:
-        Mapping of environment variable name to the value it assigns.
+        Mapping of environment variable name to the value it assigns, which may be
+        the empty string.
     """
     out: dict[str, str] = {}
     for raw in _ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
@@ -172,10 +175,27 @@ def _env_example_assignments() -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         name, _, value = line.partition("=")
-        name, value = name.strip(), value.strip()
-        if name and value:
-            out[name] = value
+        name = name.strip()
+        if name:
+            out[name] = value.strip()
     return out
+
+
+def _mentions_exactly(text: str, name: str) -> bool:
+    """Report whether ``text`` mentions ``name`` as a whole token.
+
+    A plain substring test lets a longer variable stand in for a shorter one —
+    ``OLLAMA_API_KEY`` would satisfy a check for ``OLLAMA_API``, so a newly added
+    setting could stay undocumented behind a prefix collision.
+
+    Args:
+        text: The document to search.
+        name: The environment variable name.
+
+    Returns:
+        ``True`` when the name appears not adjacent to another name character.
+    """
+    return re.search(rf"(?<![A-Z0-9_]){re.escape(name)}(?![A-Z0-9_])", text) is not None
 
 
 _MISSING = object()
@@ -206,7 +226,7 @@ class TestDocsMatchConfig(unittest.TestCase):
             cls.settings = Settings.from_env()
         cls.env_names = _env_names_read_by_config()
         cls.readme_defaults = _readme_documented_defaults()
-        cls.env_example = _env_example_assignments()
+        cls.env_example = _env_example_all_assignments()
 
     def test_scraper_finds_the_known_settings(self) -> None:
         """Guard the scrapers themselves — a silent zero-match would pass everything."""
@@ -218,9 +238,17 @@ class TestDocsMatchConfig(unittest.TestCase):
     def test_readme_defaults_match_code(self) -> None:
         """Every default the README states is the one the code applies."""
         for name, documented in sorted(self.readme_defaults.items()):
-            if name in _NO_DEFAULT or name in _NO_SETTINGS_ATTR or name not in self.env_names:
+            if name in _NO_DEFAULT or name in _NO_SETTINGS_ATTR:
                 continue
             with self.subTest(setting=name):
+                # Unknown names are rejected, not skipped: otherwise the contract is
+                # one-way — additions get checked, but a removed or renamed setting
+                # leaves its stale default documented forever.
+                self.assertIn(
+                    name,
+                    self.env_names,
+                    f"README documents a default for {name}, which config.py no longer reads",
+                )
                 actual = _actual_default(self.settings, name)
                 self.assertIsNot(actual, _MISSING, f"{name} has no matching Settings attribute")
                 self.assertEqual(
@@ -230,11 +258,22 @@ class TestDocsMatchConfig(unittest.TestCase):
                 )
 
     def test_env_example_values_match_code(self) -> None:
-        """Every value .env.example assigns is the real default."""
+        """Every value .env.example assigns is the real default.
+
+        An empty value means "unset", which *is* the default, so it carries no claim
+        to compare — but the name is still checked against ``config.py``.
+        """
         for name, documented in sorted(self.env_example.items()):
-            if name in _NO_DEFAULT or name in _NO_SETTINGS_ATTR or name not in self.env_names:
+            if name in _NO_DEFAULT or name in _NO_SETTINGS_ATTR:
                 continue
             with self.subTest(setting=name):
+                self.assertIn(
+                    name,
+                    self.env_names,
+                    f".env.example assigns {name}, which config.py no longer reads",
+                )
+                if not documented:
+                    continue
                 actual = _actual_default(self.settings, name)
                 self.assertIsNot(actual, _MISSING, f"{name} has no matching Settings attribute")
                 self.assertEqual(
@@ -266,16 +305,26 @@ class TestDocsMatchConfig(unittest.TestCase):
         readme_text = _README.read_text(encoding="utf-8")
         for name in sorted(self.env_names):
             with self.subTest(setting=name):
-                self.assertIn(name, readme_text, f"{name} is read by config.py but absent from README.md")
+                self.assertTrue(
+                    _mentions_exactly(readme_text, name),
+                    f"{name} is read by config.py but absent from README.md",
+                )
 
-    def test_every_env_var_appears_in_env_example(self) -> None:
-        """Every environment variable config.py reads is present in .env.example."""
-        env_text = _ENV_EXAMPLE.read_text(encoding="utf-8")
+    def test_every_env_var_is_assigned_in_env_example(self) -> None:
+        """Every environment variable config.py reads has an assignment in .env.example.
+
+        Checks the parsed assignments rather than the raw text, so a name that only
+        appears in a comment does not count as present.
+        """
         for name in sorted(self.env_names):
             if name in _ENV_EXAMPLE_EXEMPT:
                 continue
             with self.subTest(setting=name):
-                self.assertIn(name, env_text, f"{name} is read by config.py but absent from .env.example")
+                self.assertIn(
+                    name,
+                    self.env_example,
+                    f"{name} is read by config.py but has no assignment in .env.example",
+                )
 
 
 if __name__ == "__main__":

@@ -118,10 +118,10 @@ class TestSerenaPathSeparators(unittest.TestCase):
     def test_search_for_pattern_ripgrep_paths_are_posix(self) -> None:
         """The ripgrep branch normalises the absolute paths rg prints.
 
-        Guards the drive-letter defect: `line.split(":", 1)[0]` on a Windows
+        Guards the drive-letter defect: splitting on the first colon of a Windows
         absolute path yields ``"D"``, which used to be recorded as a repo path.
         """
-        rg_stdout = f"{self.target}:1:alpha needle beta\n"
+        rg_stdout = f"{self.target}\0" + "1:alpha needle beta\n"
         fake = mock.Mock(stdout=rg_stdout, returncode=0)
 
         with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
@@ -133,11 +133,9 @@ class TestSerenaPathSeparators(unittest.TestCase):
     def test_search_for_pattern_handles_colons_in_matched_text(self) -> None:
         """A `:<digits>:` inside the matched source line does not confuse the parser.
 
-        Pins the non-greedy quantifier in ``_MATCH_LINE_RE``. Source lines contain
-        such sequences routinely (timestamps, slice syntax), and a greedy pattern
-        swallows them into the captured path.
+        Source lines contain such sequences routinely (timestamps, slice syntax).
         """
-        rg_stdout = f'{self.target}:1:cfg = {{"t":12:}}\n'
+        rg_stdout = f"{self.target}\0" + '1:cfg = {"t":12:}\n'
         fake = mock.Mock(stdout=rg_stdout, returncode=0)
 
         with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
@@ -146,11 +144,56 @@ class TestSerenaPathSeparators(unittest.TestCase):
         self.assertEqual(result["matches"], ['src/pkg/a.txt:1:cfg = {"t":12:}'])
         self.assertEqual(self.ctx.used_paths, {"src/pkg/a.txt"})
 
-    def test_ripgrep_is_invoked_from_the_repo_root_with_a_relative_target(self) -> None:
-        """rg runs with cwd=repo root and a repo-relative target, so it prints relative paths.
+    def test_search_for_pattern_handles_colons_in_the_filename(self) -> None:
+        """A filename containing `:<digits>:` resolves to itself, not to a prefix.
 
-        The parser tolerates absolute output, so this is defence in depth — but
-        nothing else would notice a regression back to an absolute search target.
+        Colons are legal in POSIX filenames. Splitting on the first `:<digits>:`
+        parsed `src:2:notes.txt` as `src` — and because a `src/` directory exists,
+        an existence check did not catch it either. Only the NUL delimiter does.
+        """
+        # The file is not created: colons are illegal in Windows filenames, and the
+        # NUL parse does not stat the path, so its existence is irrelevant here.
+        # A `src/` directory *does* exist (from setUp) — that is what made the old
+        # existence check pass while returning the wrong path.
+        rg_stdout = "src:2:notes.txt\0" + "1:needle\n"
+        fake = mock.Mock(stdout=rg_stdout, returncode=0)
+
+        with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
+            result = _tool_result(self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "needle"})))
+
+        self.assertEqual(result["matches"], ["src:2:notes.txt:1:needle"])
+        self.assertEqual(self.ctx.used_paths, {"src:2:notes.txt"})
+
+    def test_unparseable_ripgrep_output_falls_back_to_python_search(self) -> None:
+        """Output without NUL delimiters is not guessed at — the search is redone.
+
+        An rg build that ignored `--null` would otherwise yield "no matches", which
+        is a wrong answer rather than a degraded one.
+        """
+        legacy_stdout = f"{self.target}:1:alpha needle beta\n"
+        fake = mock.Mock(stdout=legacy_stdout, returncode=0)
+
+        with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
+            result = _tool_result(self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "needle"})))
+
+        self.assertIn("Python fallback", result.get("note", ""))
+        self.assertTrue(any(m.startswith("src/pkg/a.txt:") for m in result["matches"]))
+
+    def test_ripgrep_error_with_no_output_falls_back_to_python_search(self) -> None:
+        """An rg failure is not reported as "no matches"."""
+        fake = mock.Mock(stdout="", returncode=2)
+
+        with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
+            result = _tool_result(self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "needle"})))
+
+        self.assertIn("Python fallback", result.get("note", ""))
+        self.assertTrue(result["matches"])
+
+    def test_ripgrep_is_invoked_from_the_repo_root_with_null_delimiters(self) -> None:
+        """rg runs with cwd=repo root, `--null`, and a repo-relative target.
+
+        `--null` is what makes the path unambiguous, so a regression that drops it
+        would silently reintroduce the fabricated-path class of bug.
         """
         fake = mock.Mock(stdout="", returncode=1)
 
@@ -159,6 +202,7 @@ class TestSerenaPathSeparators(unittest.TestCase):
 
         argv, kwargs = run.call_args[0][0], run.call_args[1]
         self.assertEqual(kwargs["cwd"], str(self.repo))
+        self.assertIn("--null", argv)
         self.assertEqual(argv[-1], "src/pkg")
         self.assertFalse(Path(argv[-1]).is_absolute())
 
@@ -166,7 +210,7 @@ class TestSerenaPathSeparators(unittest.TestCase):
         """A match rg reports outside the repo root is dropped, not emitted raw."""
         with tempfile.TemporaryDirectory() as outside_td:
             stray = Path(outside_td).resolve() / "elsewhere.txt"
-            fake = mock.Mock(stdout=f"{stray}:1:alpha needle beta\n", returncode=0)
+            fake = mock.Mock(stdout=f"{stray}\0" + "1:alpha needle beta\n", returncode=0)
 
             with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
                 result = _tool_result(self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "needle"})))
