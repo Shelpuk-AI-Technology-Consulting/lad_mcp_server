@@ -206,7 +206,11 @@ def _extract_path_from_arguments(arguments_json: str) -> str | None:
     raw_path = args.get("path") or args.get("relative_path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
-    return raw_path.strip()
+    # Repo-relative paths are POSIX identifiers on both sides of the tool boundary
+    # (see `SerenaContext._repo_relative_posix`). Without normalizing the model's raw
+    # argument, a Windows-style `src\a.txt` counts as a second distinct path in the
+    # exploration digest alongside the normalized `src/a.txt` from the tool result.
+    return raw_path.strip().replace("\\", "/")
 
 
 def _update_exploration_digest(
