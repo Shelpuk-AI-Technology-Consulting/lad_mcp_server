@@ -76,6 +76,32 @@ def _pristine_environment() -> Iterator[None]:
                 yield
 
 
+def _is_os_environ(node: ast.AST) -> bool:
+    """Report whether an AST node refers to ``os.environ``.
+
+    Args:
+        node: Any AST node.
+
+    Returns:
+        ``True`` when the node is the ``os.environ`` attribute access.
+    """
+    return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+
+def _string_constant(node: ast.AST) -> str | None:
+    """Return a node's value when it is a string literal.
+
+    Args:
+        node: Any AST node.
+
+    Returns:
+        The string value, or ``None`` when the node is not a string constant.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
 def _env_names_read_by_config() -> set[str]:
     """Collect the environment variable names ``config.py`` reads.
 
@@ -83,21 +109,41 @@ def _env_names_read_by_config() -> set[str]:
     onto the line after the opening parenthesis — which is exactly where the two
     model settings that drifted live, so a naive pattern would miss them.
 
+    Recognises all four access shapes, not just the helpers: a variable read via
+    ``os.environ.get`` or ``os.environ[...]`` would otherwise be invisible to this
+    contract, and could be added undocumented with the suite still green.
+
     Returns:
-        The set of environment variable names passed to the config readers.
+        The set of environment variable names read by the config module.
     """
     tree = ast.parse(_CONFIG_PY.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
+        # `os.environ["NAME"]`
+        if isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            name = _string_constant(node.slice)
+            if name is not None:
+                names.add(name)
+            continue
+
         if not isinstance(node, ast.Call) or not node.args:
             continue
         func = node.func
+        # `os.environ.get("NAME")` — checked before the bare-name helpers so an
+        # unrelated `.get` on some other object cannot slip through.
+        if isinstance(func, ast.Attribute) and func.attr == "get" and _is_os_environ(func.value):
+            name = _string_constant(node.args[0])
+            if name is not None:
+                names.add(name)
+            continue
+
+        # `_get_int("NAME", ...)` / `os.getenv("NAME")`
         func_name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
         if func_name not in _ENV_READERS:
             continue
-        first = node.args[0]
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            names.add(first.value)
+        name = _string_constant(node.args[0])
+        if name is not None:
+            names.add(name)
     return names
 
 
@@ -132,6 +178,9 @@ def _env_example_assignments() -> dict[str, str]:
     return out
 
 
+_MISSING = object()
+
+
 def _actual_default(settings: Settings, name: str) -> object:
     """Read the ``Settings`` attribute corresponding to an env var name.
 
@@ -140,9 +189,11 @@ def _actual_default(settings: Settings, name: str) -> object:
         name: The environment variable name.
 
     Returns:
-        The default value the code applies.
+        The default value the code applies, or a sentinel when no attribute of
+        that name exists — so the caller can report which setting is unmapped
+        rather than raising an opaque ``AttributeError``.
     """
-    return getattr(settings, name.lower())
+    return getattr(settings, name.lower(), _MISSING)
 
 
 class TestDocsMatchConfig(unittest.TestCase):
@@ -171,6 +222,7 @@ class TestDocsMatchConfig(unittest.TestCase):
                 continue
             with self.subTest(setting=name):
                 actual = _actual_default(self.settings, name)
+                self.assertIsNot(actual, _MISSING, f"{name} has no matching Settings attribute")
                 self.assertEqual(
                     str(actual).lower(),
                     documented.lower(),
@@ -184,6 +236,7 @@ class TestDocsMatchConfig(unittest.TestCase):
                 continue
             with self.subTest(setting=name):
                 actual = _actual_default(self.settings, name)
+                self.assertIsNot(actual, _MISSING, f"{name} has no matching Settings attribute")
                 self.assertEqual(
                     str(actual).lower(),
                     documented.lower(),

@@ -132,7 +132,14 @@ class SerenaContext:
         if matched is None:
             return None
         raw_path = matched.group("path")
-        rel = self._repo_relative_posix(Path(raw_path))
+        candidate = Path(raw_path)
+        # `resolve()` is non-strict, so any string the regex accepts would otherwise
+        # become a "repo path used". Colons are legal in POSIX filenames, so a file
+        # named `notes:2:draft.md` would fabricate the entry `notes` — the same class
+        # of defect as the Windows drive-letter bug. Require the file to exist.
+        if not (candidate if candidate.is_absolute() else self.repo_root / candidate).exists():
+            return None
+        rel = self._repo_relative_posix(candidate)
         if rel is None:
             return None
         return rel, rel + line[len(raw_path) :]

@@ -16,6 +16,7 @@ still guard the contract against a future regression.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,13 +66,17 @@ class TestSerenaPathSeparators(unittest.TestCase):
         self.ctx = ctx
 
     def assert_posix_relative(self, value: str) -> None:
-        """Assert a emitted path string is backslash-free and not absolute.
+        """Assert an emitted path string is backslash-free and not absolute.
 
         Args:
             value: A path or a ``path:line:text`` match string.
         """
         self.assertNotIn("\\", value)
-        self.assertFalse(Path(value.split(":")[0]).is_absolute())
+        head = value.split(":")[0]
+        self.assertFalse(Path(head).is_absolute())
+        # `Path("D").is_absolute()` is False, so the drive-letter form needs its own
+        # check — that shape is exactly what the ripgrep parsing bug produced.
+        self.assertIsNone(re.match(r"^[A-Za-z]:", value))
 
     def test_list_dir_path_is_posix(self) -> None:
         """`list_dir` reports a nested directory with forward slashes."""
@@ -124,6 +129,38 @@ class TestSerenaPathSeparators(unittest.TestCase):
 
         self.assertEqual(result["matches"], ["src/pkg/a.txt:1:alpha needle beta"])
         self.assertEqual(self.ctx.used_paths, {"src/pkg/a.txt"})
+
+    def test_search_for_pattern_handles_colons_in_matched_text(self) -> None:
+        """A `:<digits>:` inside the matched source line does not confuse the parser.
+
+        Pins the non-greedy quantifier in ``_MATCH_LINE_RE``. Source lines contain
+        such sequences routinely (timestamps, slice syntax), and a greedy pattern
+        swallows them into the captured path.
+        """
+        rg_stdout = f'{self.target}:1:cfg = {{"t":12:}}\n'
+        fake = mock.Mock(stdout=rg_stdout, returncode=0)
+
+        with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake):
+            result = _tool_result(self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "cfg"})))
+
+        self.assertEqual(result["matches"], ['src/pkg/a.txt:1:cfg = {"t":12:}'])
+        self.assertEqual(self.ctx.used_paths, {"src/pkg/a.txt"})
+
+    def test_ripgrep_is_invoked_from_the_repo_root_with_a_relative_target(self) -> None:
+        """rg runs with cwd=repo root and a repo-relative target, so it prints relative paths.
+
+        The parser tolerates absolute output, so this is defence in depth — but
+        nothing else would notice a regression back to an absolute search target.
+        """
+        fake = mock.Mock(stdout="", returncode=1)
+
+        with mock.patch("lad_mcp_server.serena_bridge.subprocess.run", return_value=fake) as run:
+            self.ctx.call_tool("search_for_pattern", json.dumps({"pattern": "needle", "path": "src/pkg"}))
+
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(kwargs["cwd"], str(self.repo))
+        self.assertEqual(argv[-1], "src/pkg")
+        self.assertFalse(Path(argv[-1]).is_absolute())
 
     def test_search_for_pattern_drops_matches_outside_the_repo(self) -> None:
         """A match rg reports outside the repo root is dropped, not emitted raw."""
