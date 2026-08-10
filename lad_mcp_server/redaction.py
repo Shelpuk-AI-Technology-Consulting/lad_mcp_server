@@ -42,10 +42,30 @@ DEFAULT_RULES: tuple[RedactionRule, ...] = (
         name="jwt",
         pattern=re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     ),
-    # PEM blocks (best-effort)
+    # PEM blocks (best-effort).
+    #
+    # The body is a *tempered* token — it may not span another `-----BEGIN `. With a
+    # plain `[\s\S]*?`, every unterminated BEGIN marker made the lazy body scan all
+    # the way to end-of-input, so a document full of them was quadratic: 6400 markers
+    # took 124 seconds. Stopping at the next marker makes a failed scan local, which
+    # is linear — the same input now takes 69ms. Redaction runs 2-3 times per review
+    # on the async path, so this was a CPU amplifier reachable from untrusted input.
+    #
+    # `[\s\S]` rather than a `-`-excluding class: encrypted PEMs carry `Proc-Type:`
+    # and `DEK-Info: AES-128-CBC` headers, which contain hyphens.
+    # The label is matched generically per RFC 7468 rather than as a fixed list. The
+    # previous `(?:RSA |EC |OPENSSH |)?` alternation silently missed
+    # `ENCRYPTED PRIVATE KEY` — a password-protected PKCS#8 key, the standard way to
+    # store one with a passphrase — as well as `DSA PRIVATE KEY` and
+    # `PGP PRIVATE KEY BLOCK`. All three leaked their whole body while
+    # `contains_unredacted_secrets` reported clean.
     RedactionRule(
         name="pem_private_key",
-        pattern=re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |)?PRIVATE KEY-----"),
+        pattern=re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----"
+            r"(?:(?!-----BEGIN )[\s\S])*?"
+            r"-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----"
+        ),
     ),
 )
 

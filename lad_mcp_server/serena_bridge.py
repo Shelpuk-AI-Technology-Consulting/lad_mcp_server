@@ -726,7 +726,10 @@ class SerenaContext:
                 if head_n is not None:
                     lines.append("\n[NOTE: Middle of file omitted due to size.]\n")
                 lines.extend(list(tail_lines))
-            content = "".join(lines)
+            # Redact here too: this branch returns without reaching the whole-text
+            # redaction below, and its head/tail line slicing cuts PEM terminators
+            # exactly as the char-based truncation does.
+            content = redact_text("".join(lines))
             result: dict[str, Any] = {"path": rel, "content": content}
             if (
                 size > LARGE_FILE_READ_MAX_BYTES
@@ -741,7 +744,13 @@ class SerenaContext:
             return result
 
         # Normal path: load full text.
-        text = target.read_text(encoding="utf-8", errors="replace")
+        #
+        # Redact BEFORE truncating. `call_tool` redacts the assembled result too, but
+        # by then the head/tail slice below has already cut the `-----END-----` marker
+        # off any PEM block, and the multi-line rule cannot match what is no longer
+        # there — so the key material would egress. A second pass only ever redacts more
+        # (monotonic), so the later pass is harmless.
+        text = redact_text(target.read_text(encoding="utf-8", errors="replace"))
 
         # Auto-truncate files above the character threshold.
         if len(text) > READ_FILE_TRUNCATE_THRESHOLD:
