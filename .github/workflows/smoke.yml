@@ -7,6 +7,12 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    # TEMPORARY: verifying the docker and git-install cases before this lands.
+    # `workflow_dispatch` cannot reach a workflow that is not yet on the default
+    # branch, so this is the only way to exercise them pre-merge. Removed before merge.
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
