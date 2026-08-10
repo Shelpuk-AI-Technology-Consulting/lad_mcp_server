@@ -28,4 +28,8 @@ jobs:
         run: python -m ruff check .
 
       - name: Run tests
-        run: python -m pytest tests/ -q
+        # `-m "not slow"` excludes the distribution-building smoke cases (uvx, docker):
+        # this runner has Docker, so they would not skip, and a full image build would
+        # add minutes to every PR. They run on merge to main via smoke.yml.
+        # `-rs` surfaces skip reasons, so a permanently-skipped case cannot hide.
+        run: python -m pytest tests/ -q -m "not slow" -rs

@@ -12,7 +12,11 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 dependencies = [
-  "mcp[cli]>=1.2.0",
+  # Upper bound is load-bearing, not caution: mcp 2.0.0 removed `mcp.server.fastmcp`,
+  # which `server.py` imports. Without it a fresh install resolves to 2.x and the
+  # server cannot start at all — while the unit suite stays green, because nothing
+  # in `tests/` imports the SDK. See tests/smoke/ for the check that catches this.
+  "mcp[cli]>=1.2.0,<2",
   "openai>=1.0.0",
   "httpx>=0.27.0",
   "python-dotenv>=1.0.0",
@@ -30,6 +34,14 @@ dev = [
 
 [project.scripts]
 lad-mcp-server = "lad_mcp_server.__main__:main"
+
+[tool.pytest.ini_options]
+# --strict-markers so a typo'd `@pytest.mark.slwo` errors instead of quietly moving a
+# distribution-building case into the PR job, where it would add minutes to every run.
+addopts = "--strict-markers"
+markers = [
+  "slow: builds or installs a distribution (uv run, uvx, docker). Excluded from the PR job; run on merge to main.",
+]
 
 [tool.ruff]
 line-length = 120
