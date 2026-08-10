@@ -195,7 +195,7 @@ def _mentions_exactly(text: str, name: str) -> bool:
     Returns:
         ``True`` when the name appears not adjacent to another name character.
     """
-    return re.search(rf"(?<![A-Z0-9_]){re.escape(name)}(?![A-Z0-9_])", text) is not None
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text) is not None
 
 
 _MISSING = object()
@@ -247,7 +247,9 @@ class TestDocsMatchConfig(unittest.TestCase):
                 self.assertIn(
                     name,
                     self.env_names,
-                    f"README documents a default for {name}, which config.py no longer reads",
+                    f"README documents a default for {name}, which config.py no longer reads. "
+                    "Remove the stale entry, or add the name to _NO_SETTINGS_ATTR if it is "
+                    "deliberately documented but not a Lad setting (an MCP client's own variable, say).",
                 )
                 actual = _actual_default(self.settings, name)
                 self.assertIsNot(actual, _MISSING, f"{name} has no matching Settings attribute")
