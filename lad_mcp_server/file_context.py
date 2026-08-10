@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from lad_mcp_server.path_utils import safe_resolve_under_repo
+from lad_mcp_server.redaction import redact_text
 
 _EXCLUDED_DIR_NAMES = {
     ".git",
@@ -163,7 +164,11 @@ class FileContextBuilder:
                 if self._is_likely_binary(sample):
                     skipped.append({"path": rel, "reason": "binary"})
                     continue
-                content = data.decode("utf-8", errors="replace")
+                # Redact BEFORE the budget truncation below. The caller redacts the
+                # assembled section too, but the partial slice can cut a PEM block's
+                # `-----END-----` marker, and the multi-line rule cannot match what is
+                # no longer there. A second pass only ever redacts more, so this is safe.
+                content = redact_text(data.decode("utf-8", errors="replace"))
             except OSError:
                 skipped.append({"path": rel, "reason": "read_failed"})
                 continue

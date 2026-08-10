@@ -10,4 +10,5 @@ pydantic-settings>=2.2.0
 
 # Dev/test (optional but recommended)
 pytest>=8.0.0
+hypothesis>=6.100,<7
 ruff>=0.5.0,<0.17.0
