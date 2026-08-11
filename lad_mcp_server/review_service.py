@@ -1,3 +1,37 @@
+"""Review orchestration: prompt assembly, the reviewer tool loop, and provider routing.
+
+**The direct-provider routing contract**, recorded here because adding a provider
+touches 19 sites across 8 functions in this module and the sequence is not obvious:
+
+1. A model name's prefix decides its provider (``deepseek/``, ``z-ai/``,
+   ``moonshotai/``, ``ollama/``, ``openai_compat/`` or ``litellm/``). No prefix means
+   OpenRouter.
+2. Direct providers **skip the OpenRouter models API** and use a static token budget
+   derived from ``OPENROUTER_MAX_INPUT_CHARS`` (see ``_prepare_reviewer_config``).
+   That is deliberate: the metadata fetch fails closed, and no other gateway serves
+   OpenRouter's enriched schema.
+3. A direct call that fails falls back to OpenRouter — **but only when
+   ``OPENROUTER_API_KEY`` is configured.** Without it there is nothing to fall back
+   to, and attempting anyway would replace the real error with an authentication
+   failure. A deployment behind a corporate gateway may have no OpenRouter account.
+   This is checked in three places, because a provider can also decline to run
+   *without* raising: each provider's ``except``, the terminal fallthrough at the end
+   of ``_call_model_with_provider_fallback``, and Kimi's sticky-fallback bookkeeping.
+4. The fallback sends the model name **unchanged**, so it only works where the
+   routing prefix doubles as a real OpenRouter vendor route. It does for
+   ``deepseek/``, ``z-ai/`` and ``moonshotai/``. It does **not** for
+   ``openai_compat/`` or ``litellm/``, which are synthetic and name a model on the
+   operator's own gateway, so that provider never falls back at all. (``ollama/`` has
+   the same mismatch and is not handled — pre-existing.)
+5. Nothing is ever sourced from the ambient environment: not the credential, and not
+   the organization, project or custom headers the OpenAI SDK also reads. See
+   ``openai_compat_client._get_client`` for the version-by-version measurements.
+
+Newer providers thread a single ``direct_<name>_model_name`` parameter, where
+``None`` means "not routed here"; the older ones additionally carry a redundant
+``use_<name>_direct`` boolean.
+"""
+
 from __future__ import annotations
 
 import re
@@ -35,6 +69,11 @@ from lad_mcp_server.serena_bridge import BASELINE_REQUIRED_MEMORIES, SerenaConte
 from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
 from lad_mcp_server.deepseek_client import DeepSeekClient, is_deepseek_model, normalize_deepseek_model_name
 from lad_mcp_server.kimi_code_client import KimiCodeClient, is_kimi_model, normalize_kimi_model_name
+from lad_mcp_server.openai_compat_client import (
+    OpenAiCompatClient,
+    is_openai_compat_model,
+    normalize_openai_compat_model_name,
+)
 from lad_mcp_server.zai_coding_client import ZaiCodingClient, is_zai_model, normalize_zai_model_name
 
 
@@ -435,6 +474,8 @@ class ReviewerConfig:
     direct_deepseek_model_name: str | None = None
     use_ollama_direct: bool = False
     direct_ollama_model_name: str | None = None
+    # Single parameter: `None` means "not routed here". See the module docstring.
+    direct_openai_compat_model_name: str | None = None
 
 
 class ReviewService:
@@ -449,16 +490,23 @@ class ReviewService:
         kimi_client: KimiCodeClient | Any | None = None,
         deepseek_client: DeepSeekClient | Any | None = None,
         ollama_client: OllamaCloudClient | Any | None = None,
+        openai_compat_client: OpenAiCompatClient | Any | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
+        # Normalised to "" so both clients keep their `str` contract; each then treats
+        # a falsy key as "send no auth". Never pass this through to the OpenAI SDK:
+        # `AsyncOpenAI(api_key=None)` reads the ambient OPENAI_API_KEY — set in most
+        # Claude Code / Codex environments — and would send an operator's personal key
+        # to openrouter.ai. See `openai_compat_client._get_client`.
+        openrouter_key = self._settings.openrouter_api_key or ""
         self._openrouter = openrouter_client or OpenRouterClient(
-            api_key=self._settings.openrouter_api_key,
+            api_key=openrouter_key,
             http_referer=self._settings.openrouter_http_referer,
             x_title=self._settings.openrouter_x_title,
             max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
         )
         self._models = models_client or OpenRouterModelsClient(
-            api_key=self._settings.openrouter_api_key,
+            api_key=openrouter_key,
             ttl_seconds=self._settings.openrouter_model_metadata_ttl_seconds,
         )
         self._zai = zai_client
@@ -477,6 +525,15 @@ class ReviewService:
         if self._deepseek is None and self._settings.deepseek_api_key:
             self._deepseek = DeepSeekClient(
                 api_key=self._settings.deepseek_api_key,
+                max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
+            )
+        self._openai_compat = openai_compat_client
+        if self._openai_compat is None and self._settings.openai_compat_base_url:
+            self._openai_compat = OpenAiCompatClient(
+                base_url=self._settings.openai_compat_base_url,
+                # May legitimately be None: a local gateway needs no auth. The client
+                # normalises it and omits the header rather than sending `Bearer `.
+                api_key=self._settings.openai_compat_api_key,
                 max_concurrent_requests=self._settings.openrouter_max_concurrent_requests,
             )
         self._ollama = ollama_client
@@ -739,6 +796,7 @@ class ReviewService:
         use_deepseek_direct: bool,
         direct_ollama_model_name: str | None = None,
         use_ollama_direct: bool = False,
+        direct_openai_compat_model_name: str | None = None,
         messages: list[dict[str, Any]],
         timeout_seconds: int,
         max_output_tokens: int,
@@ -754,6 +812,61 @@ class ReviewService:
             else None
         )
 
+        # Falling back to OpenRouter is only possible when there is a credential for
+        # it. In a gateway-only deployment, attempting anyway replaces the provider's
+        # real error with an authentication failure — and, before the key was
+        # normalised, would have sent the operator's ambient OPENAI_API_KEY. This
+        # applies to every direct provider, not just the newest one.
+        can_fall_back = bool(self._settings.openrouter_api_key)
+
+        def _note_direct_failure(provider: str, label: str, exc: Exception) -> None:
+            """Record a direct-provider failure, and whether a fallback follows.
+
+            Args:
+                provider: The provider identifier used in the disclosure block.
+                label: Human-readable provider name for the note.
+                exc: The failure being recorded.
+            """
+            if can_fall_back:
+                note = f"{label} endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
+                provider_used[:] = ["openrouter"]
+            else:
+                # Do not claim a fallback that cannot happen, and keep the disclosure
+                # honest about which provider actually served (or failed) the review.
+                note = f"{label} endpoint failed: {_exc_message(exc)}. No OPENROUTER_API_KEY to fall back to."
+                provider_used[:] = [provider]
+            provider_notes.append(note)
+            log.warning("Direct %s call failed for model '%s': %s", label, model, note)
+
+        if direct_openai_compat_model_name and self._openai_compat is not None:
+            try:
+                result = await self._openai_compat.chat_completion(
+                    model=direct_openai_compat_model_name,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    extra_body=direct_extra_body,
+                )
+                provider_used[:] = ["openai_compat"]
+                return result
+            except Exception as exc:
+                # Never retried on OpenRouter, even with a key. The other providers'
+                # prefixes are real OpenRouter vendor routes (`deepseek/...`,
+                # `z-ai/...`), so their fallback resolves; `openai_compat/` and
+                # `litellm/` are synthetic, and the name after the prefix means
+                # whatever the operator's gateway says it means. Retrying there can
+                # only turn the gateway's real error into "model not found".
+                note = (
+                    f"OpenAI-compatible endpoint failed: {_exc_message(exc)}. Not retried on "
+                    f"OpenRouter: '{model}' names a model on that gateway, not an OpenRouter model."
+                )
+                provider_notes.append(note)
+                provider_used[:] = ["openai_compat"]
+                log.warning("Direct OpenAI-compatible call failed for model '%s': %s", model, note)
+                raise
+
         if use_deepseek_direct and self._deepseek is not None and direct_deepseek_model_name:
             try:
                 result = await self._deepseek.chat_completion(
@@ -768,10 +881,9 @@ class ReviewService:
                 provider_used[:] = ["deepseek"]
                 return result
             except Exception as exc:
-                note = f"DeepSeek endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                provider_notes.append(note)
-                provider_used[:] = ["openrouter"]
-                log.warning("Direct DeepSeek call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+                _note_direct_failure("deepseek", "DeepSeek", exc)
+                if not can_fall_back:
+                    raise
 
         if use_ollama_direct and self._ollama is not None and direct_ollama_model_name:
             try:
@@ -787,10 +899,9 @@ class ReviewService:
                 provider_used[:] = ["ollama"]
                 return result
             except Exception as exc:
-                note = f"Ollama Cloud endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                provider_notes.append(note)
-                provider_used[:] = ["openrouter"]
-                log.warning("Direct Ollama call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+                _note_direct_failure("ollama", "Ollama Cloud", exc)
+                if not can_fall_back:
+                    raise
 
         if use_zai_direct and self._zai is not None and direct_model_name:
             try:
@@ -806,10 +917,9 @@ class ReviewService:
                 provider_used[:] = ["zai_coding_plan"]
                 return result
             except Exception as exc:
-                note = f"Z.AI Coding Plan endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                provider_notes.append(note)
-                provider_used[:] = ["openrouter"]
-                log.warning("Direct Z.AI call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+                _note_direct_failure("zai_coding_plan", "Z.AI Coding Plan", exc)
+                if not can_fall_back:
+                    raise
 
         if use_kimi_direct and self._kimi is not None and direct_kimi_model_name:
             if not self._is_kimi_fallback_active(model):
@@ -826,11 +936,29 @@ class ReviewService:
                     provider_used[:] = ["kimi_code"]
                     return result
                 except Exception as exc:
-                    self._remember_kimi_fallback(model)
-                    note = f"Kimi Code endpoint failed: {_exc_message(exc)}. Fell back to OpenRouter."
-                    provider_notes.append(note)
-                    provider_used[:] = ["openrouter"]
-                    log.warning("Direct Kimi Code call failed for model '%s'; falling back to OpenRouter: %s", model, note)
+                    # The sticky flag exists to stop retrying Kimi and use OpenRouter
+                    # instead. With no OpenRouter credential there is no "instead", so
+                    # recording it would only make the next review skip the one
+                    # provider it has and report a worse error than this one.
+                    if can_fall_back:
+                        self._remember_kimi_fallback(model)
+                    _note_direct_failure("kimi_code", "Kimi Code", exc)
+                    if not can_fall_back:
+                        raise
+
+        # Guard the fallthrough itself, not just the per-provider `except` blocks. A
+        # provider can decline to run without raising: Kimi's sticky fallback skips its
+        # whole block for 10 minutes after one failure, which lands here with no
+        # credential and turns the real problem into an authentication error.
+        if not can_fall_back:
+            # `provider_used` still holds its "openrouter" default, which would credit
+            # the disclosure to a service this call never touched.
+            provider_used[:] = ["none"]
+            raise RuntimeError(
+                f"No direct provider handled model '{model}', and OPENROUTER_API_KEY is "
+                "not set, so there is nothing to fall back to. Check the configuration "
+                "for the provider this model is routed to."
+            )
 
         provider_used[:] = ["openrouter"]
         return await self._call_openrouter_with_tool_choice_fallback(
@@ -856,6 +984,7 @@ class ReviewService:
         direct_deepseek_model_name: str | None = None,
         use_ollama_direct: bool = False,
         direct_ollama_model_name: str | None = None,
+        direct_openai_compat_model_name: str | None = None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
         snapshot_tool_call_index: int,
@@ -888,6 +1017,7 @@ class ReviewService:
                     use_deepseek_direct=use_deepseek_direct,
                     direct_ollama_model_name=direct_ollama_model_name,
                     use_ollama_direct=use_ollama_direct,
+                    direct_openai_compat_model_name=direct_openai_compat_model_name,
                     messages=messages_snapshot,
                     timeout_seconds=self._intermittent_timeout,
                     max_output_tokens=max_output_tokens,
@@ -959,6 +1089,9 @@ class ReviewService:
         direct_deepseek_model_name: str | None,
         use_ollama_direct: bool,
         direct_ollama_model_name: str | None,
+        # Defaulted: `None` already means "not routed here", so callers that predate
+        # this provider stay correct without being edited.
+        direct_openai_compat_model_name: str | None = None,
         extra_body: dict[str, Any] | None,
         max_output_tokens: int,
     ) -> None:
@@ -984,6 +1117,7 @@ class ReviewService:
             "direct_deepseek_model_name": direct_deepseek_model_name,
             "use_ollama_direct": use_ollama_direct,
             "direct_ollama_model_name": direct_ollama_model_name,
+            "direct_openai_compat_model_name": direct_openai_compat_model_name,
             "extra_body": extra_body,
             "max_output_tokens": max_output_tokens,
             "snapshot_tool_call_index": state.tool_calls_so_far,
@@ -1008,6 +1142,7 @@ class ReviewService:
                 direct_deepseek_model_name=direct_deepseek_model_name,
                 use_ollama_direct=use_ollama_direct,
                 direct_ollama_model_name=direct_ollama_model_name,
+                direct_openai_compat_model_name=direct_openai_compat_model_name,
                 extra_body=extra_body,
                 max_output_tokens=max_output_tokens,
                 snapshot_tool_call_index=state.tool_calls_so_far,
@@ -1193,9 +1328,11 @@ class ReviewService:
         reviewer_start = time.monotonic()
 
         # R8: If model metadata fetch fails, fail closed (no OpenRouter completion requests are sent).
-        primary_cfg = self._prepare_reviewer_config(primary_model, repo_root=resolved_root)
+        primary_cfg = self._prepare_reviewer_config(primary_model, repo_root=resolved_root, role="primary reviewer")
         secondary_cfg = (
-            self._prepare_reviewer_config(secondary_model, repo_root=resolved_root) if secondary_enabled else None
+            self._prepare_reviewer_config(secondary_model, repo_root=resolved_root, role="secondary reviewer")
+            if secondary_enabled
+            else None
         )
 
         primary_task = asyncio.create_task(
@@ -1308,7 +1445,7 @@ class ReviewService:
             return f"Only Secondary review is available. Primary reviewer failed: {primary.error}"
         return f"Both reviewers failed.\n- Primary error: {primary.error}\n- Secondary error: {secondary.error}"
 
-    def _prepare_reviewer_config(self, model: str, *, repo_root: Path) -> ReviewerConfig:
+    def _prepare_reviewer_config(self, model: str, *, repo_root: Path, role: str = "reviewer") -> ReviewerConfig:
         use_zai_direct = (
             bool(self._settings.zai_coding_plan_key)
             and self._zai is not None
@@ -1344,7 +1481,28 @@ class ReviewService:
         )
         direct_ollama_model_name = normalize_ollama_model_name(model) if use_ollama_direct else None
 
-        if use_zai_direct or use_kimi_direct or use_deepseek_direct or use_ollama_direct:
+        # Single parameter, no companion boolean: `None` means "not routed here", and
+        # the normaliser never returns "" so there is no ambiguous third state.
+        routes_to_openai_compat = self._openai_compat is not None and is_openai_compat_model(model)
+        direct_openai_compat_model_name = (
+            normalize_openai_compat_model_name(model) if routes_to_openai_compat else None
+        )
+        if is_openai_compat_model(model) and not routes_to_openai_compat:
+            # Without this the user gets "not found in OpenRouter models list", which
+            # points at the wrong problem entirely.
+            log.warning(
+                "Model '%s' carries an OpenAI-compatible prefix but no endpoint is configured; "
+                "set OPENAI_COMPAT_BASE_URL to route it directly.",
+                model,
+            )
+
+        if (
+            use_zai_direct
+            or use_kimi_direct
+            or use_deepseek_direct
+            or use_ollama_direct
+            or direct_openai_compat_model_name is not None
+        ):
             input_budget_tokens = max(self._settings.openrouter_max_input_chars // CHARS_PER_TOKEN_ESTIMATE, 1)
             budget = TokenBudget(
                 effective_context_length=(
@@ -1362,6 +1520,29 @@ class ReviewService:
             supported_parameters: tuple[str, ...] = ("tools", "tool_choice", "max_tokens")
             tool_calling_supported = True
         else:
+            # This model needs OpenRouter. Fail here rather than at call time: this is
+            # the only point upstream of both the models-API fetch and every
+            # chat_completion, so it is the only place "no network is attempted" holds.
+            if not self._settings.openrouter_api_key:
+                # Two different mistakes reach here, and the advice differs. A model
+                # already carrying the prefix means the endpoint is missing, not the
+                # prefix — repeating "add the prefix" would read as if we had not
+                # noticed the one they added.
+                if is_openai_compat_model(model):
+                    remedy = (
+                        "Set OPENAI_COMPAT_BASE_URL to the endpoint that serves it, or set "
+                        "OPENROUTER_API_KEY."
+                    )
+                else:
+                    remedy = (
+                        "Either set OPENROUTER_API_KEY, or point this reviewer at a configured "
+                        "direct provider — e.g. prefix the model with `openai_compat/` "
+                        "(or `litellm/`) and set OPENAI_COMPAT_BASE_URL."
+                    )
+                raise RuntimeError(
+                    f"The {role} model '{model}' is not routed to a direct provider and "
+                    f"OPENROUTER_API_KEY is not set. {remedy}"
+                )
             try:
                 meta = self._models.get_model(model)
                 budget = TokenBudget(
@@ -1419,6 +1600,7 @@ class ReviewService:
             direct_deepseek_model_name=direct_deepseek_model_name,
             use_ollama_direct=use_ollama_direct,
             direct_ollama_model_name=direct_ollama_model_name,
+            direct_openai_compat_model_name=direct_openai_compat_model_name,
         )
 
     async def _run_single_reviewer(
@@ -1527,6 +1709,7 @@ class ReviewService:
                     direct_deepseek_model_name=cfg.direct_deepseek_model_name,
                     use_ollama_direct=cfg.use_ollama_direct,
                     direct_ollama_model_name=cfg.direct_ollama_model_name,
+                    direct_openai_compat_model_name=cfg.direct_openai_compat_model_name,
                     provider_used=provider_used,
                     provider_notes=provider_notes,
                     intermittent_state=intermittent_state,
@@ -1769,6 +1952,7 @@ class ReviewService:
         direct_deepseek_model_name: str | None = None,
         use_ollama_direct: bool = False,
         direct_ollama_model_name: str | None = None,
+        direct_openai_compat_model_name: str | None = None,
         provider_used: list[str] | None = None,
         provider_notes: list[str] | None = None,
         intermittent_state: IntermittentReviewState | None = None,
@@ -1835,6 +2019,7 @@ class ReviewService:
                 use_deepseek_direct=use_deepseek_direct,
                 direct_ollama_model_name=direct_ollama_model_name,
                 use_ollama_direct=use_ollama_direct,
+                direct_openai_compat_model_name=direct_openai_compat_model_name,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
@@ -2014,6 +2199,7 @@ class ReviewService:
                                 direct_deepseek_model_name=direct_deepseek_model_name,
                                 use_ollama_direct=use_ollama_direct,
                                 direct_ollama_model_name=direct_ollama_model_name,
+                                direct_openai_compat_model_name=direct_openai_compat_model_name,
                                 extra_body=extra_body,
                                 max_output_tokens=min(
                                     self._settings.intermittent_max_output_tokens,
@@ -2187,9 +2373,13 @@ def _format_reviewer_error(model: str, error: str) -> str:
         f"**Reviewer Error** for model `{model}`.\n\n"
         "## Key Findings\n"
         f"- **High**: {error}\n\n"
+        # Provider-agnostic: this text also renders for a deployment that routes every
+        # reviewer to a direct provider, where "set OPENROUTER_API_KEY" is wrong advice
+        # printed directly above a note explaining that OpenRouter was never involved.
         "## Recommendations\n"
-        "- Ensure OPENROUTER_API_KEY is set and model names are valid.\n"
-        "- Verify OpenRouter Models API is reachable.\n\n"
+        "- Check the model name and the credentials for the provider it routes to.\n"
+        "- If this model routes to OpenRouter, verify OPENROUTER_API_KEY and that the "
+        "OpenRouter Models API is reachable.\n\n"
         "## Questions / Unknowns\n"
         "- Did the model support tool calling and/or was Serena available?\n"
     )

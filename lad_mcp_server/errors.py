@@ -20,9 +20,11 @@ def format_fatal_error(message: str) -> str:
         "An error occurred while processing the request.\n\n"
         "## Key Findings\n"
         f"- **High**: {message}\n\n"
+        # Kept provider-agnostic: OPENROUTER_API_KEY is no longer required, so naming
+        # it as the thing to check misdirects a direct-provider deployment.
         "## Recommendations\n"
-        "- Check configuration (OPENROUTER_API_KEY, model names).\n"
-        "- Ensure OpenRouter Models API is reachable.\n\n"
+        "- Check configuration (provider credentials, model names).\n"
+        "- Ensure the endpoint the model routes to is reachable.\n\n"
         "## Questions / Unknowns\n"
         "- None.\n"
     )

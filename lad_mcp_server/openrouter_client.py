@@ -157,6 +157,14 @@ class OpenRouterClient:
         with self._client_lock:
             if self._client is not None:
                 return self._client
+            if not self._api_key:
+                # No credential: `AsyncOpenAI(api_key=None)` would send the ambient
+                # OPENAI_API_KEY to openrouter.ai, and `api_key=""` raises on
+                # openai >= 2.34. See `openai_compat_client._get_client` for the
+                # measurements. Unreachable in practice — `_prepare_reviewer_config`
+                # fails closed first — but the client must not depend on that.
+                self._client = "stdlib"
+                return self._client
             try:
                 from openai import AsyncOpenAI
             except Exception:  # pragma: no cover
@@ -184,10 +192,13 @@ class OpenRouterClient:
         extra_body: dict[str, Any] | None,
     ) -> OpenRouterCallResult:
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        # Omitted rather than sent as `Bearer `, so a keyless request cannot be
+        # mistaken for an authenticated one that was rejected.
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         headers.update(self._default_headers)
 
         # OpenRouter does not accept `reasoning_content` on assistant messages; strip before sending.

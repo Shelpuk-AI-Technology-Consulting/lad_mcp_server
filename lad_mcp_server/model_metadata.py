@@ -125,12 +125,15 @@ class OpenRouterModelsClient:
             return models
 
     def _fetch_models_payload(self) -> dict[str, Any]:
+        headers = {"Accept": "application/json"}
+        # Omitted rather than sent as `Bearer `, matching the chat client. Unreachable
+        # in practice: `_prepare_reviewer_config` fails closed before any model whose
+        # metadata would be fetched without a key.
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/models",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Accept": "application/json",
-            },
+            headers=headers,
             method="GET",
         )
 

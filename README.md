@@ -166,14 +166,15 @@ Lad exposes two MCP tools:
 - **`system_design_review`**  –  Reviews architectural proposals, design documents, and planning decisions
 - **`code_review`**  –  Reviews implementation code, diffs, and file changes
 
-Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
+Each tool runs **two reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary. Each reviewer is served by OpenRouter or by a configured direct endpoint, depending on its model name.
 
 
 ## Requirements
 
 - Python 3.11+
 - `uv` (recommended) or `pip`
-- `OPENROUTER_API_KEY` (required)
+- At least one provider credential: `OPENROUTER_API_KEY`, or a direct provider such as
+  `OPENAI_COMPAT_BASE_URL` (see [Direct provider endpoints](#direct-provider-endpoints))
 
 ## Quickstart
 
@@ -425,9 +426,13 @@ If Antigravity can’t find `uvx`, replace `"uvx"` with an absolute path (run `w
 
 ## Configuration (environment variables)
 
-### Required
+### Provider credentials
 
-- `OPENROUTER_API_KEY`
+At least one is required.
+
+- `OPENROUTER_API_KEY` — required unless every reviewer model is routed to a
+  direct provider below. A deployment behind a corporate gateway can omit it
+  entirely; a model that still needs OpenRouter then fails with a message saying so.
 
 ### OpenRouter models
 
@@ -444,14 +449,32 @@ OPENROUTER_PRIMARY_REVIEWER_MODEL=moonshotai/kimi-k2.5
 
 ### Direct provider endpoints
 
-Lad can route reviewer calls directly to provider endpoints, bypassing OpenRouter for lower latency and cost. When a direct call fails, Lad automatically falls back to OpenRouter.
+Lad can route reviewer calls directly to provider endpoints, bypassing OpenRouter for lower latency and cost. When a direct call fails, Lad falls back to OpenRouter — but only if `OPENROUTER_API_KEY` is set. Without it there is nothing to fall back to, so the provider's own error is surfaced instead.
 
 | Model prefix | Endpoint | Env variable | Notes |
 |---|---|---|---|
 | `z-ai/` or `zai/` | Z.AI Coding Plan | `ZAI_CODING_PLAN_KEY` | Supports Preserved Thinking (reasoning models like GLM-5). Model prefix is stripped: `z-ai/glm-5` → `glm-5`. |
 | `deepseek/` | DeepSeek API | `DEEPSEEK_API_KEY` | Thinking mode enabled automatically. Model prefix is stripped: `deepseek/deepseek-v4-pro` → `deepseek-v4-pro`. Reasoning content is preserved across tool-call rounds. |
 | `moonshotai/` or `kimi-for-coding` | Kimi Code | `KIMI_CODE_API_KEY` | Routes to Kimi Code endpoint. All models normalize to `kimi-for-coding`. |
+| `openai_compat/` or `litellm/` | Any OpenAI-compatible endpoint | `OPENAI_COMPAT_BASE_URL` (required), `OPENAI_COMPAT_API_KEY` (optional) | For LiteLLM, vLLM and internal gateways. Prefix is stripped: `litellm/gpt-4o` → `gpt-4o`. The key is optional so a keyless local gateway works; when unset, no `Authorization` header is sent. `reasoning_content` is stripped, so a gateway fronting DeepSeek or GLM loses that round-tripping. |
 | `ollama/` or `ollama_cloud/` | Ollama Cloud | `OLLAMA_API_KEY` | Prefix is stripped: `ollama/gemma4:31b` → `gemma4:31b`. Note Ollama model ids are `name:size`, **not** `vendor/model` — write `ollama/gemma4:31b`, not `ollama/google/gemma4`. |
+
+Example for an internal LiteLLM (or any OpenAI-compatible) gateway, with no OpenRouter account at all:
+
+```json
+{
+  "lad": {
+    "env": {
+      "OPENAI_COMPAT_BASE_URL": "https://litellm.internal.example.com/v1",
+      "OPENAI_COMPAT_API_KEY": "...",
+      "OPENROUTER_PRIMARY_REVIEWER_MODEL": "litellm/<model-registered-in-your-gateway>",
+      "OPENROUTER_SECONDARY_REVIEWER_MODEL": "litellm/<another-model>"
+    }
+  }
+}
+```
+
+Set **both** reviewer models: the secondary otherwise keeps its OpenRouter default and the review fails with no key configured.
 
 Example configuration for Z.AI GLM-5.1 as primary, DeepSeek as secondary:
 
@@ -485,6 +508,8 @@ Example configuration for Z.AI GLM-5.1 as primary, DeepSeek as secondary:
 - `KIMI_CODE_API_KEY` (optional). When set, models with `moonshotai/` prefix or `kimi-for-coding` route directly to the Kimi Code endpoint.
 - `DEEPSEEK_API_KEY` (optional). When set, models with `deepseek/` prefix route directly to the DeepSeek API with thinking mode enabled.
 - `OLLAMA_API_KEY` (optional). When set, models with `ollama/` or `ollama_cloud/` prefix route directly to Ollama Cloud.
+- `OPENAI_COMPAT_BASE_URL` (optional). The root of any OpenAI-compatible endpoint, e.g. `https://litellm.internal.example.com/v1`. When set, models with an `openai_compat/` or `litellm/` prefix are sent there.
+- `OPENAI_COMPAT_API_KEY` (optional). Bearer token for that endpoint. Omit it for a gateway that needs no auth — no `Authorization` header is sent, and Lad never falls back to an ambient `OPENAI_API_KEY`.
 
 ### Budgeting / limits
 
@@ -670,7 +695,8 @@ We also recommend that you prioritize OpenRouter providers by throughput:
 ## Troubleshooting
 
 - First run is slow / client times out: run the `uvx` command from Quickstart once in a terminal to prewarm, then restart the client.
-- “OPENROUTER_API_KEY is required”: ensure the MCP client process has access to the variable (or paste it into the client config).
+- “No provider credentials configured”: Lad needs `OPENROUTER_API_KEY` **or** a direct provider (see [Direct provider endpoints](#direct-provider-endpoints)). Ensure the MCP client process has access to the variable (or paste it into the client config).
+- “is not routed to a direct provider and OPENROUTER_API_KEY is not set”: one of your two reviewer models still points at OpenRouter. The message names which one — the secondary reviewer defaults to an OpenRouter model, so set `OPENROUTER_SECONDARY_REVIEWER_MODEL` too, or `0` to disable it.
 - Secondary reviewer is too expensive/slow: set `OPENROUTER_SECONDARY_REVIEWER_MODEL=0`.
 - Reviewer returns “Reviewer Error” on timeout: ensure your MCP client's tool execution timeout exceeds Lad's `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS`. For Claude Code, set `MCP_TOOL_TIMEOUT` (in the Lad `env` block or globally) to at least 2× your reviewer timeout.
 - `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS must be > OPENROUTER_REVIEWER_TIMEOUT_SECONDS`: Lad requires the tool-call timeout to be **strictly greater** than the reviewer timeout — equal values risk both firing at once and cancelling the reviewer prematurely. Increase `OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS` or decrease `OPENROUTER_REVIEWER_TIMEOUT_SECONDS`.

@@ -54,7 +54,11 @@ def _load_env_file(path: Path) -> None:
 
 @dataclass(frozen=True)
 class Settings:
-    openrouter_api_key: str
+    # Optional since a deployment may route every reviewer to a direct provider and
+    # never touch OpenRouter. Normalised to "" by ReviewService so the clients keep
+    # their `str` contract; they then omit auth entirely rather than construct an
+    # OpenAI SDK client, which would read the ambient OPENAI_API_KEY.
+    openrouter_api_key: str | None
 
     openrouter_primary_reviewer_model: str
     openrouter_secondary_reviewer_model: str
@@ -83,6 +87,8 @@ class Settings:
     kimi_code_api_key: str | None = None
     deepseek_api_key: str | None = None
     ollama_api_key: str | None = None
+    openai_compat_base_url: str | None = None
+    openai_compat_api_key: str | None = None
     intermittent_review_calls: int = 2
     intermittent_max_output_tokens: int = 1500
 
@@ -104,8 +110,32 @@ class Settings:
             pass
 
         api_key = _get_str("OPENROUTER_API_KEY")
-        if not api_key:
-            raise ValueError("OPENROUTER_API_KEY is required")
+
+        # Direct-provider credentials are read before validation, because
+        # OPENROUTER_API_KEY is only required when nothing else can serve a review.
+        # A user behind a corporate gateway cannot reach openrouter.ai at all, so
+        # demanding a key they cannot obtain would block the whole product.
+        zai_key = _get_str("ZAI_CODING_PLAN_KEY")
+        kimi_key = _get_str("KIMI_CODE_API_KEY")
+        deepseek_key = _get_str("DEEPSEEK_API_KEY")
+        ollama_key = _get_str("OLLAMA_API_KEY")
+        # Stripped because this value both enables the provider and becomes a URL: a
+        # whitespace-only setting would otherwise look configured and then fail at
+        # request time with "unknown url type".
+        openai_compat_base_url = (_get_str("OPENAI_COMPAT_BASE_URL") or "").strip() or None
+        openai_compat_api_key = _get_str("OPENAI_COMPAT_API_KEY")
+
+        # The base URL alone enables the OpenAI-compatible provider: a local gateway
+        # (vLLM, a dev LiteLLM) legitimately needs no key.
+        has_direct_provider = any(
+            [zai_key, kimi_key, deepseek_key, ollama_key, openai_compat_base_url]
+        )
+        if not api_key and not has_direct_provider:
+            raise ValueError(
+                "No provider credentials configured. Set OPENROUTER_API_KEY, or configure a "
+                "direct provider: OPENAI_COMPAT_BASE_URL (any OpenAI-compatible endpoint), "
+                "ZAI_CODING_PLAN_KEY, KIMI_CODE_API_KEY, DEEPSEEK_API_KEY or OLLAMA_API_KEY."
+            )
 
         max_concurrency = _get_int("OPENROUTER_MAX_CONCURRENT_REQUESTS", 4)
         if max_concurrency <= 0:
@@ -174,10 +204,12 @@ class Settings:
             lad_serena_max_total_chars=_get_int("LAD_SERENA_MAX_TOTAL_CHARS", 100000),
             lad_serena_max_dir_entries=_get_int("LAD_SERENA_MAX_DIR_ENTRIES", 100),
             lad_serena_max_search_results=_get_int("LAD_SERENA_MAX_SEARCH_RESULTS", 20),
-            zai_coding_plan_key=_get_str("ZAI_CODING_PLAN_KEY"),
-            kimi_code_api_key=_get_str("KIMI_CODE_API_KEY"),
-            deepseek_api_key=_get_str("DEEPSEEK_API_KEY"),
-            ollama_api_key=_get_str("OLLAMA_API_KEY"),
+            zai_coding_plan_key=zai_key,
+            kimi_code_api_key=kimi_key,
+            deepseek_api_key=deepseek_key,
+            ollama_api_key=ollama_key,
+            openai_compat_base_url=openai_compat_base_url,
+            openai_compat_api_key=openai_compat_api_key,
             intermittent_review_calls=intermittent_review_calls,
             intermittent_max_output_tokens=intermittent_max_output_tokens,
         )
