@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import json
+import os
 import re
 import threading
 import urllib.error
@@ -44,6 +46,34 @@ from lad_mcp_server.openrouter_client import (
 # `litellm/` is accepted alongside the neutral name so the originally requested setup
 # stays discoverable. Dual prefixes have precedent in `ollama_cloud_client.py`.
 _OPENAI_COMPAT_PREFIX_RE = re.compile(r"^(?:openai_compat|litellm)/", re.IGNORECASE)
+
+
+# Guards the environment swap below. Module-level because the swap is process-wide:
+# two clients constructing at once must not restore each other's snapshot.
+_AMBIENT_ENV_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _ambient_openai_settings_suppressed() -> Any:
+    """Remove every ``OPENAI_*`` variable for the duration of the block.
+
+    The OpenAI SDK reads several settings from the environment when the matching
+    constructor argument is omitted — the API key, the organization and project ids,
+    and (from 2.53) arbitrary request headers. Every one of those would be sent to
+    this client's *user-supplied* base URL. Naming them individually would be a
+    denylist against a dependency with no upper bound, so the whole namespace goes.
+
+    Yields:
+        ``None``, with the variables removed; they are restored on exit.
+    """
+    with _AMBIENT_ENV_LOCK:
+        saved = {key: value for key, value in os.environ.items() if key.startswith("OPENAI_")}
+        for key in saved:
+            del os.environ[key]
+        try:
+            yield
+        finally:
+            os.environ.update(saved)
 
 
 class OpenAiCompatClientError(RuntimeError):
@@ -193,6 +223,15 @@ class OpenAiCompatClient:
         construct an SDK client at all without a credential — the stdlib path below
         simply omits the header.
 
+        The key is not the only ambient setting the SDK reads. Measured on both 2.16
+        and 2.53, ``OPENAI_ORG_ID`` and ``OPENAI_PROJECT_ID`` become
+        ``openai-organization`` / ``openai-project`` request headers, and 2.53 also
+        merges arbitrary headers from ``OPENAI_CUSTOM_HEADERS``. All of that would go
+        to the operator's gateway. Suppressing the three known names would be a
+        denylist against an unbounded dependency — the same mistake as pinning
+        ``api_key=""`` — so construction happens with every ``OPENAI_*`` variable
+        removed, which also covers whatever a future release adds.
+
         Returns:
             An ``AsyncOpenAI`` instance, or ``"stdlib"`` when the SDK is absent or no
             credential is configured.
@@ -211,11 +250,12 @@ class OpenAiCompatClient:
                 self._client = "stdlib"
                 return self._client
 
-            self._client = AsyncOpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={"User-Agent": "claude-code/1.0"},
-            )
+            with _ambient_openai_settings_suppressed():
+                self._client = AsyncOpenAI(
+                    base_url=self._base_url,
+                    api_key=self._api_key,
+                    default_headers={"User-Agent": "claude-code/1.0"},
+                )
             return self._client
 
     def _headers(self) -> dict[str, str]:

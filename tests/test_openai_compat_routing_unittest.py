@@ -141,7 +141,7 @@ class TestRoutingToTheGateway(unittest.TestCase):
 
 
 class TestFallbackRequiresSomethingToFallBackTo(unittest.TestCase):
-    """The fallback is skipped when no OpenRouter credential exists."""
+    """The fallback is skipped when it has no credential — or nothing to route to."""
 
     def test_without_an_openrouter_key_the_real_error_surfaces(self) -> None:
         """The gateway's own failure is reported, and OpenRouter is never attempted."""
@@ -164,55 +164,30 @@ class TestFallbackRequiresSomethingToFallBackTo(unittest.TestCase):
             "*Provider: `openrouter`*", out, "must not credit a provider that was never called"
         )
 
-    def test_with_an_openrouter_key_the_existing_fallback_still_happens(self) -> None:
-        """Configured OpenRouter deployments keep the behaviour they had."""
+    def test_the_gateway_is_never_retried_on_openrouter_even_with_a_key(self) -> None:
+        """A gateway model name has no OpenRouter equivalent, so the retry cannot work.
+
+        The other providers' prefixes double as real OpenRouter vendor routes, so
+        `deepseek/deepseek-v4` resolves on both. `litellm/` does not exist on
+        OpenRouter, and the name after it means whatever the operator's gateway says —
+        so retrying there replaces the gateway's real error with "model not found".
+        """
         gateway = _RecordingClient(fail_with=RuntimeError("gateway refused the request"))
         openrouter = _RecordingClient()
-
-        class _Meta:
-            """Minimal model metadata for the fallback path."""
-
-            supported_parameters = ("max_tokens",)
-
-            def effective_context_length(self) -> int:
-                """Return a usable context length.
-
-                Returns:
-                    A context length large enough for the budget to validate.
-                """
-                return 50000
-
-            def effective_output_budget(self, fixed: int) -> int:
-                """Return the output budget.
-
-                Args:
-                    fixed: The configured fixed output tokens.
-
-                Returns:
-                    The same value.
-                """
-                return fixed
-
-            def supports_tools(self) -> bool:
-                """Report tool support.
-
-                Returns:
-                    ``False``.
-                """
-                return False
-
         service = ReviewService(
             repo_root=None,
             settings=_settings(openrouter_api_key="sk-present"),
             openrouter_client=openrouter,
-            models_client=type("M", (), {"get_model": lambda self, m: _Meta()})(),
+            models_client=_ExplodingModelsClient(),
             openai_compat_client=gateway,
         )
 
         out = asyncio.run(service.code_review(code="print('hello world')", paths=None))
 
-        self.assertEqual(len(openrouter.calls), 1, "fallback should have been attempted")
-        self.assertIn("Fell back to OpenRouter", out)
+        self.assertEqual(openrouter.calls, [], "a gateway-local name must not be sent to OpenRouter")
+        self.assertIn("gateway refused the request", out)
+        self.assertIn("Not retried on OpenRouter", out, "the disclosure must say why")
+        self.assertNotIn("Fell back to OpenRouter", out)
 
 
 class TestOpenRouterBoundModelWithoutAKey(unittest.TestCase):

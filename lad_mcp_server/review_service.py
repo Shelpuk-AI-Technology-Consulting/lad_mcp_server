@@ -17,8 +17,14 @@ touches 19 sites across 8 functions in this module and the sequence is not obvio
    This is checked in three places, because a provider can also decline to run
    *without* raising: each provider's ``except``, the terminal fallthrough at the end
    of ``_call_model_with_provider_fallback``, and Kimi's sticky-fallback bookkeeping.
-4. Credentials are never sourced from the ambient environment, and a client with no
-   credential must not construct an OpenAI SDK client at all — see
+4. The fallback sends the model name **unchanged**, so it only works where the
+   routing prefix doubles as a real OpenRouter vendor route. It does for
+   ``deepseek/``, ``z-ai/`` and ``moonshotai/``. It does **not** for
+   ``openai_compat/`` or ``litellm/``, which are synthetic and name a model on the
+   operator's own gateway, so that provider never falls back at all. (``ollama/`` has
+   the same mismatch and is not handled — pre-existing.)
+5. Nothing is ever sourced from the ambient environment: not the credential, and not
+   the organization, project or custom headers the OpenAI SDK also reads. See
    ``openai_compat_client._get_client`` for the version-by-version measurements.
 
 Newer providers thread a single ``direct_<name>_model_name`` parameter, where
@@ -846,9 +852,20 @@ class ReviewService:
                 provider_used[:] = ["openai_compat"]
                 return result
             except Exception as exc:
-                _note_direct_failure("openai_compat", "OpenAI-compatible", exc)
-                if not can_fall_back:
-                    raise
+                # Never retried on OpenRouter, even with a key. The other providers'
+                # prefixes are real OpenRouter vendor routes (`deepseek/...`,
+                # `z-ai/...`), so their fallback resolves; `openai_compat/` and
+                # `litellm/` are synthetic, and the name after the prefix means
+                # whatever the operator's gateway says it means. Retrying there can
+                # only turn the gateway's real error into "model not found".
+                note = (
+                    f"OpenAI-compatible endpoint failed: {_exc_message(exc)}. Not retried on "
+                    f"OpenRouter: '{model}' names a model on that gateway, not an OpenRouter model."
+                )
+                provider_notes.append(note)
+                provider_used[:] = ["openai_compat"]
+                log.warning("Direct OpenAI-compatible call failed for model '%s': %s", model, note)
+                raise
 
         if use_deepseek_direct and self._deepseek is not None and direct_deepseek_model_name:
             try:

@@ -166,7 +166,7 @@ Lad exposes two MCP tools:
 - **`system_design_review`**  –  Reviews architectural proposals, design documents, and planning decisions
 - **`code_review`**  –  Reviews implementation code, diffs, and file changes
 
-Each tool runs **two OpenRouter-backed reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary.
+Each tool runs **two reviewers in parallel** (Primary + Secondary) and returns both outputs plus a synthesized summary. Each reviewer is served by OpenRouter or by a configured direct endpoint, depending on its model name.
 
 
 ## Requirements

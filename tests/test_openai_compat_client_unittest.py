@@ -9,6 +9,7 @@ would be sent somewhere the user did not intend.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from typing import Any
 from unittest import mock
@@ -319,6 +320,64 @@ class TestCredentialIsolation(unittest.TestCase):
                 self.skipTest("openai SDK not installed")
 
             self.assertEqual(sdk.auth_headers, {"Authorization": "Bearer gateway-key"})
+
+    def test_no_ambient_openai_setting_reaches_the_gateway(self) -> None:
+        """The key is not the only thing the SDK reads from the environment.
+
+        Measured on 2.16 and 2.53: `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID` become
+        request headers, and 2.53 merges arbitrary ones from `OPENAI_CUSTOM_HEADERS`.
+        All of it would go to a base URL the user supplied. Asserted on the built
+        request rather than on constructor arguments, and as an allowlist, so a future
+        release that adds a fourth ambient source fails here instead of leaking.
+        """
+        # Checked as values rather than as the variables' literal text: 2.53 splits
+        # OPENAI_CUSTOM_HEADERS on ":" and lowercases the name, so asserting the raw
+        # JSON is absent passes while the secret inside it still goes on the wire.
+        secrets = (
+            "sk-operators-personal-key",
+            "org-operators-personal-org",
+            "proj-operators-personal-project",
+            "must-not-leak",
+        )
+        ambient = {
+            "OPENAI_API_KEY": secrets[0],
+            "OPENAI_ORG_ID": secrets[1],
+            "OPENAI_PROJECT_ID": secrets[2],
+            "OPENAI_CUSTOM_HEADERS": '{"X-Internal-Secret": "%s"}' % secrets[3],
+            "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        }
+        with mock.patch.dict("os.environ", ambient):
+            client = OpenAiCompatClient(base_url=_BASE_URL, api_key="gateway-key", max_concurrent_requests=1)
+            sdk = client._get_client()
+            if sdk == "stdlib":  # pragma: no cover - only without the openai package
+                self.skipTest("openai SDK not installed")
+
+            import openai
+
+            request = sdk._build_request(
+                openai._models.FinalRequestOptions.construct(
+                    method="post", url="/chat/completions", json_data={}
+                )
+            )
+            sent = "\n".join(f"{name}: {value}" for name, value in request.headers.items()).lower()
+
+        for secret in secrets:
+            with self.subTest(leaked=secret):
+                self.assertNotIn(secret.lower(), sent)
+        self.assertEqual(str(sdk.base_url).rstrip("/"), _BASE_URL, "the ambient base URL must not win")
+        self.assertIn("bearer gateway-key", sent, "the configured key must still be sent")
+
+    def test_the_ambient_environment_is_restored_after_construction(self) -> None:
+        """Suppression is a process-wide swap, so leaving it in place would break others."""
+        ambient = {"OPENAI_API_KEY": "sk-operators-personal-key", "OPENAI_ORG_ID": "org-x"}
+        with mock.patch.dict("os.environ", ambient):
+            OpenAiCompatClient(
+                base_url=_BASE_URL, api_key="gateway-key", max_concurrent_requests=1
+            )._get_client()
+
+            for name, value in ambient.items():
+                with self.subTest(variable=name):
+                    self.assertEqual(os.environ.get(name), value)
 
 
 class TestErrorSurface(unittest.TestCase):

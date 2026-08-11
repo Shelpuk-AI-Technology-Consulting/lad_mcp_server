@@ -140,6 +140,63 @@ class TestNoFallbackWithoutACredential(unittest.TestCase):
                 )
 
 
+class TestTheFallbackStillWorksWhereItCan(unittest.TestCase):
+    """FR9: a configured OpenRouter deployment keeps the behaviour it had.
+
+    Kept on DeepSeek rather than the new provider, because the property depends on the
+    prefix being a real OpenRouter vendor route: `deepseek/deepseek-v4` resolves on
+    both services, so retrying there is a genuine second chance.
+    """
+
+    def test_a_deepseek_failure_is_retried_on_openrouter_under_the_same_name(self) -> None:
+        openrouter = _CountingOpenRouter()
+
+        class _Meta:
+            """Minimal metadata so the OpenRouter path can build a budget."""
+
+            supported_parameters = ("max_tokens",)
+
+            def effective_context_length(self) -> int:
+                """Return a context length large enough to validate.
+
+                Returns:
+                    A usable context length.
+                """
+                return 50000
+
+            def effective_output_budget(self, fixed: int) -> int:
+                """Return the output budget unchanged.
+
+                Args:
+                    fixed: The configured fixed output tokens.
+
+                Returns:
+                    The same value.
+                """
+                return fixed
+
+            def supports_tools(self) -> bool:
+                """Report tool support.
+
+                Returns:
+                    ``False``.
+                """
+                return False
+
+        service = ReviewService(
+            repo_root=None,
+            settings=_settings(deepseek_api_key="configured", openrouter_api_key="sk-present"),
+            openrouter_client=openrouter,
+            models_client=type("M", (), {"get_model": lambda self, m: _Meta()})(),
+            deepseek_client=_FailingClient("deepseek endpoint refused the request"),
+        )
+
+        out = asyncio.run(service.code_review(code="print('hello world')", paths=None))
+
+        self.assertEqual(openrouter.calls[0]["model"], "deepseek/deepseek-v4")
+        self.assertIn("Fell back to OpenRouter", out)
+
+
 class TestKimiStickyFallbackHonoursTheGuard(unittest.TestCase):
     """A provider can decline to run without raising, landing on the fallthrough.
 
