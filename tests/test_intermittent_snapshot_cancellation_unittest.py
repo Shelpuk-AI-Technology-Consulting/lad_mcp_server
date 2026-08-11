@@ -150,6 +150,77 @@ class TestIntermittentDispatchCancellation(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class TestQueuedSnapshotKeepsItsRouting(unittest.TestCase):
+    """A queued snapshot must reach the same provider the first one did.
+
+    `_dispatch_intermittent_review` builds its arguments twice — once as a `request`
+    dict for the queued path, once as `create_task` kwargs — and the dict is splatted
+    into a signature where every routing argument has a default. Omitting one from the
+    dict type-checks, passes every other test, and silently sends the queued snapshot
+    to OpenRouter instead.
+    """
+
+    def test_the_queued_snapshot_reaches_the_direct_provider_too(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                gateway_calls: list[str] = []
+                openrouter_calls: list[str] = []
+
+                async def _gateway(**kwargs):
+                    gateway_calls.append(kwargs["model"])
+                    await asyncio.sleep(0.01)
+                    return OpenRouterCallResult(
+                        content="## Summary\nSnapshot from the configured gateway.",
+                        tool_calls=[],
+                        raw={},
+                    )
+
+                async def _openrouter(**kwargs):
+                    openrouter_calls.append(kwargs["model"])
+                    return OpenRouterCallResult(content="## Summary\nWrong provider.", tool_calls=[], raw={})
+
+                gateway = mock.Mock()
+                gateway.chat_completion = _gateway
+                openrouter = mock.Mock()
+                openrouter.chat_completion = _openrouter
+
+                service = ReviewService(
+                    repo_root=Path(td),
+                    settings=_build_settings(openai_compat_base_url="https://gateway.example.com/v1"),
+                    openrouter_client=openrouter,
+                    models_client=mock.Mock(),
+                    openai_compat_client=gateway,
+                )
+                state = IntermittentReviewState()
+
+                for content in ("first", "second"):
+                    service._dispatch_intermittent_review(
+                        state=state,
+                        model="litellm/gateway-model",
+                        messages=[{"role": "user", "content": content}],
+                        use_zai_direct=False,
+                        direct_model_name=None,
+                        use_kimi_direct=False,
+                        direct_kimi_model_name=None,
+                        use_deepseek_direct=False,
+                        direct_deepseek_model_name=None,
+                        use_ollama_direct=False,
+                        direct_ollama_model_name=None,
+                        direct_openai_compat_model_name="gateway-model",
+                        extra_body=None,
+                        max_output_tokens=100,
+                    )
+
+                await asyncio.wait_for(state.in_flight_task, timeout=1)
+                if state.in_flight_task is not None:
+                    await asyncio.wait_for(state.in_flight_task, timeout=1)
+
+                self.assertEqual(gateway_calls, ["gateway-model", "gateway-model"])
+                self.assertEqual(openrouter_calls, [], "the queued snapshot must not be re-routed")
+
+        asyncio.run(scenario())
+
+
 class TestTimeoutWaitsForInFlightSnapshot(unittest.TestCase):
     def test_timeout_waits_for_in_flight_snapshot_and_returns_it(self) -> None:
         async def scenario():

@@ -11,7 +11,8 @@ Runtime invariants pinned here, none of which live anywhere else in the repo:
   arguments and ignores ``sys.argv``;
 * stdout carries JSON-RPC and nothing else;
 * the tool set is exactly ``system_design_review`` and ``code_review``;
-* startup fails closed, and loudly, without ``OPENROUTER_API_KEY``;
+* startup succeeds for a gateway-only deployment, and fails closed — loudly — when no
+  provider credential is configured at all;
 * ``mcp`` must stay below 2.0.
 
 Distinct from ``scripts/smoke_openrouter_serena.py``, which is an in-process run
@@ -59,6 +60,13 @@ def _client_env(**overrides: str) -> dict[str, str]:
         for key, value in os.environ.items()
         if not key.startswith(("OPENROUTER_", "LAD_", "INTERMITTENT_"))
     }
+    # Put this checkout ahead of any editable install. Without it, `python -m
+    # lad_mcp_server` resolves through site-packages to whatever path the install
+    # points at — in a git worktree that is the *main* checkout, so the smoke suite
+    # would start a different copy of the server than the one under test.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO_ROOT), *([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])]
+    )
     env["OPENROUTER_API_KEY"] = _FAKE_KEY
     for key, value in overrides.items():
         if value == "":
@@ -240,8 +248,30 @@ def test_starts_with_a_minimal_client_environment(tmp_path: Path) -> None:
     """Clients that forward only named variables must still get a working server."""
     minimal = {key: os.environ[key] for key in _MINIMAL_ENV_KEYS if key in os.environ}
     minimal["OPENROUTER_API_KEY"] = _FAKE_KEY
+    # See `_client_env`: without this the child imports the installed package rather
+    # than this checkout.
+    minimal["PYTHONPATH"] = str(_REPO_ROOT)
 
     result = handshake([sys.executable, "-m", "lad_mcp_server"], env=minimal, cwd=str(tmp_path))
+
+    assert set(_tool_names(result)) == {"system_design_review", "code_review"}
+
+
+def test_starts_for_a_gateway_only_deployment(tmp_path: Path) -> None:
+    """The headline capability of issue #2: no OpenRouter account anywhere.
+
+    Every other test in this file supplies `OPENROUTER_API_KEY`, so nothing would
+    notice if the server started only when that variable happened to be set — which is
+    precisely the environment the reporter cannot create.
+    """
+    env = _client_env(
+        OPENROUTER_API_KEY="",
+        OPENAI_COMPAT_BASE_URL="https://gateway.invalid/v1",
+        OPENROUTER_PRIMARY_REVIEWER_MODEL="litellm/gateway-model",
+        OPENROUTER_SECONDARY_REVIEWER_MODEL="0",
+    )
+
+    result = handshake([sys.executable, "-m", "lad_mcp_server"], env=env, cwd=str(tmp_path))
 
     assert set(_tool_names(result)) == {"system_design_review", "code_review"}
 
@@ -303,9 +333,14 @@ def test_missing_api_key_fails_closed(tmp_path: Path) -> None:
         timeout=60,
     )
 
-    assert proc.returncode != 0, "server should refuse to start without a key"
+    assert proc.returncode != 0, "server should refuse to start with no credentials"
     assert proc.stdout == "", "nothing may reach stdout before the protocol starts"
-    assert "OPENROUTER_API_KEY is required" in proc.stderr
+    # `OPENROUTER_API_KEY` is no longer unconditionally required — a deployment may
+    # route every reviewer to a direct provider. The behaviour worth pinning is that
+    # *no* credentials at all still fails closed, and says which ones would do.
+    assert "No provider credentials configured" in proc.stderr
+    assert "OPENROUTER_API_KEY" in proc.stderr
+    assert "OPENAI_COMPAT_BASE_URL" in proc.stderr
 
 
 @pytest.mark.slow
