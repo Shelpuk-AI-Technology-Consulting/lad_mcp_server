@@ -39,6 +39,7 @@ def _normalise_spec(spec: str) -> frozenset[str]:
     """
     return frozenset(clause.strip() for clause in spec.split(",") if clause.strip())
 
+
 _UNDERLYING = ModuleNotFoundError("No module named 'mcp.server.fastmcp'")
 
 
@@ -118,6 +119,39 @@ class TestMcpImportFailureMessage(unittest.TestCase):
                     f"the constraint in the error message has drifted from {path.name}",
                 )
 
+    def test_an_mcp_below_the_minimum_is_told_to_upgrade(self) -> None:
+        """A version predating FastMCP gets the upgrade path, not "you satisfy this".
+
+        Verified against real installs: `mcp.server.fastmcp` is absent in 1.1.0 and
+        present in 1.2.0, so this branch is reachable — and an earlier version of
+        this file told such a user their version "satisfies Lad's requirement",
+        which is both false and useless. The same class of false claim the whole
+        change exists to remove.
+        """
+        with mock.patch.object(server, "_installed_mcp_version", return_value="1.1.0"):
+            message = server._mcp_import_failure_message(_UNDERLYING)
+
+        self.assertIn("1.1.0", message)
+        self.assertIn("added in mcp 1.2.0", message)
+        self.assertNotIn("satisfies", message)
+        self.assertNotIn("mcp 2.0 removed", message)
+
+    def test_version_verdict_classifies_each_side_of_both_bounds(self) -> None:
+        """Both bounds are enforced, including pre-release spellings."""
+        cases = {
+            "0.9.0": "too_old",
+            "1.1.0": "too_old",
+            "1.2.0": "supported",
+            "1.2rc1": "supported",
+            "1.29.0": "supported",
+            "2.0.0": "too_new",
+            "2.0.0rc1": "too_new",
+            # Unparseable defaults to the failure that actually happens.
+            "not-a-version": "too_new",
+        }
+        for installed, expected in cases.items():
+            with self.subTest(installed_mcp=installed):
+                self.assertEqual(server._mcp_version_verdict(installed), expected)
 
     def test_a_supported_mcp_is_not_blamed_for_the_failure(self) -> None:
         """An mcp that satisfies the constraint must not be told to downgrade.

@@ -48,21 +48,53 @@ def _import_fastmcp() -> Any:
     return FastMCP
 
 
-def _is_incompatible_mcp_major(installed: str) -> bool:
-    """Report whether an installed ``mcp`` version is the one that dropped FastMCP.
+def _leading_int(part: str) -> int | None:
+    """Read the leading integer of a version component.
+
+    Tolerates pre-release suffixes, so ``"0rc1"`` reads as ``0``. Without this a
+    version like ``1.2rc1`` would fail to parse and be misreported.
+
+    Args:
+        part: One dot-separated component of a version string.
+
+    Returns:
+        The leading integer, or ``None`` when the component does not start with one.
+    """
+    digits = ""
+    for char in part:
+        if not char.isdigit():
+            break
+        digits += char
+    return int(digits) if digits else None
+
+
+def _mcp_version_verdict(installed: str) -> str:
+    """Classify an installed ``mcp`` against Lad's requirement.
+
+    Both bounds matter, and both were verified against real installs:
+    ``mcp.server.fastmcp`` is absent in 1.1.0, present in 1.2.0, and removed again
+    in 2.0.0. So ``>=1.2.0,<2`` is exactly the window in which the module exists —
+    the lower bound is load-bearing, not caution.
 
     Args:
         installed: The version string from the package metadata.
 
     Returns:
-        ``True`` when the major version is 2 or newer, or cannot be parsed — an
-        unparseable version is treated as incompatible because that is by far the
-        likelier case, and the message still prints the underlying error either way.
+        ``"too_new"``, ``"too_old"`` or ``"supported"``. An unparseable version is
+        reported as ``"too_new"`` because that is the failure that actually happens;
+        the underlying error is printed in every case regardless.
     """
-    try:
-        return int(installed.split(".", 1)[0]) >= 2
-    except (ValueError, IndexError):
-        return True
+    parts = installed.split(".")
+    major = _leading_int(parts[0]) if parts else None
+    if major is None:
+        return "too_new"
+    minor = (_leading_int(parts[1]) if len(parts) > 1 else 0) or 0
+
+    if major >= 2:
+        return "too_new"
+    if (major, minor) < (1, 2):
+        return "too_old"
+    return "supported"
 
 
 def _mcp_import_failure_message(exc: BaseException) -> str:
@@ -91,7 +123,8 @@ def _mcp_import_failure_message(exc: BaseException) -> str:
             f"{underlying}"
         )
 
-    if _is_incompatible_mcp_major(installed):
+    verdict = _mcp_version_verdict(installed)
+    if verdict == "too_new":
         # `--with mcp<2` is unquoted deliberately: the README's client configs pass
         # args as JSON arrays, where quotes would be taken literally and uv rejects
         # the result. They are only needed in a POSIX shell, where bare `<2` redirects.
@@ -102,9 +135,15 @@ def _mcp_import_failure_message(exc: BaseException) -> str:
             "or pin it at the call site with `--with mcp<2` (quote that argument in a "
             "shell)."
         )
+    elif verdict == "too_old":
+        cause = (
+            f"Lad requires `mcp{_REQUIRED_MCP_SPEC}`: `mcp.server.fastmcp` was only "
+            "added in mcp 1.2.0. Upgrade mcp, or reinstall Lad so its pinned "
+            "dependency is applied."
+        )
     else:
-        # Do not blame the version when the version is fine. Telling this user to
-        # downgrade would be the same wrong turn issue #3 was about.
+        # Do not blame a version that is fine. Telling this user to change it would be
+        # the same wrong turn issue #3 was about, one scenario over.
         cause = (
             f"That satisfies Lad's requirement (`mcp{_REQUIRED_MCP_SPEC}`), so the "
             "import failed for some other reason - see the underlying error below."
