@@ -47,9 +47,15 @@ class TestMcpImportFailureMessage(unittest.TestCase):
     """Each cause gets a message naming it, and a fix that works for it."""
 
     def test_absent_mcp_says_it_is_not_installed(self) -> None:
-        """With no mcp present, the message prescribes installing dependencies."""
+        """With no mcp present at all, the message prescribes installing dependencies.
+
+        Presence is patched explicitly rather than inherited from the test
+        environment, where `mcp` *is* installed — otherwise this test would be
+        describing a state it never actually creates.
+        """
         with mock.patch.object(server, "_installed_mcp_version", return_value=None):
-            message = server._mcp_import_failure_message(_UNDERLYING)
+            with mock.patch.object(server, "_mcp_is_importable", return_value=False):
+                message = server._mcp_import_failure_message(_UNDERLYING)
 
         self.assertIn("not installed", message)
         self.assertRegex(message, r"pip install|uv sync")
@@ -57,6 +63,38 @@ class TestMcpImportFailureMessage(unittest.TestCase):
         # installed" and a version number is self-contradictory, and mutation testing
         # showed the suite accepted exactly that.
         self.assertNotRegex(message, r"\d+\.\d+", "must not claim a version it did not find")
+
+    def test_unreadable_metadata_does_not_claim_the_package_is_missing(self) -> None:
+        """An unreadable version must not be reported as an absent package.
+
+        `_installed_mcp_version` returns `None` for "unknown" as well as "absent" —
+        corrupt metadata, a permission error while walking `sys.path`. Treating those
+        as absent produced, verbatim, "The `mcp` package is not installed" for an
+        installed mcp: the same false claim this whole change removes, reached by a
+        different route.
+        """
+        with mock.patch.object(server, "_installed_mcp_version", return_value=None):
+            with mock.patch.object(server, "_mcp_is_importable", return_value=True):
+                message = server._mcp_import_failure_message(_UNDERLYING)
+
+        self.assertNotIn("not installed", message)
+        self.assertIn("present", message)
+        self.assertIn("mcp>=1.2.0,<2", message)
+        self.assertIn("ModuleNotFoundError", message)
+
+    def test_presence_check_does_not_depend_on_metadata(self) -> None:
+        """The presence check must survive the metadata being unreadable.
+
+        It is the only signal left when metadata is what cannot be trusted, so it
+        must not be implemented in terms of it.
+        """
+        with mock.patch("importlib.metadata.version", side_effect=OSError("unreadable")):
+            self.assertTrue(server._mcp_is_importable(), "mcp is installed in this environment")
+
+    def test_presence_check_reports_a_missing_package(self) -> None:
+        """A package that cannot be located is reported absent."""
+        with mock.patch("importlib.util.find_spec", return_value=None):
+            self.assertFalse(server._mcp_is_importable())
 
     def test_incompatible_mcp_names_the_version_and_the_constraint(self) -> None:
         """With mcp 2.0 present, the message says what is wrong and how to recover.

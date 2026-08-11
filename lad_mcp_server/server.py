@@ -20,11 +20,14 @@ _REQUIRED_MCP_SPEC = ">=1.2.0,<2"
 
 
 def _installed_mcp_version() -> str | None:
-    """Return the installed ``mcp`` version, or ``None`` if it is absent.
+    """Return the installed ``mcp`` version, or ``None`` if it cannot be determined.
+
+    ``None`` means "unknown", **not** "absent" — corrupt or unreadable metadata
+    lands here too. Use :func:`_mcp_is_importable` to tell those apart; conflating
+    them is how the message ends up claiming a package is missing when it is not.
 
     Returns:
-        The version string reported by the package metadata, or ``None`` when
-        ``mcp`` is not installed or its metadata cannot be read.
+        The version string from the package metadata, or ``None``.
     """
     try:
         from importlib.metadata import version
@@ -32,6 +35,25 @@ def _installed_mcp_version() -> str | None:
         return version("mcp")
     except Exception:
         return None
+
+
+def _mcp_is_importable() -> bool:
+    """Report whether the ``mcp`` package exists, independent of its metadata.
+
+    Deliberately does not consult ``importlib.metadata``: the point is to answer
+    "is it there?" when the metadata is exactly what cannot be trusted. ``find_spec``
+    locates the module without executing it, so a package that raises on import is
+    still correctly reported as present.
+
+    Returns:
+        ``True`` when the package can be located on the import path.
+    """
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("mcp") is not None
+    except Exception:
+        return False
 
 
 def _import_fastmcp() -> Any:
@@ -117,6 +139,16 @@ def _mcp_import_failure_message(exc: BaseException) -> str:
     # Empty as well as None: corrupt metadata can yield a blank version, and claiming
     # a nameless version is worse than saying nothing.
     if not installed:
+        if _mcp_is_importable():
+            # Present, but its version is unknowable. Saying "not installed" here
+            # would be the same false claim this message exists to remove, reached
+            # by a different route.
+            return (
+                "The `mcp` package is present but its version could not be read, so "
+                f"its compatibility cannot be checked. Lad requires `mcp{_REQUIRED_MCP_SPEC}`; "
+                "reinstall it if the install looks incomplete.\n"
+                f"{underlying}"
+            )
         return (
             "The `mcp` package is not installed. Install Lad's dependencies with "
             "`uv sync` or `pip install -e .`.\n"
